@@ -1058,7 +1058,10 @@ def _write_ortho(src_path, out, move, out_crs):
             if byte_rgb:
                 profile.update(photometric="RGB", nodata=0)
                 if has_alpha:
-                    profile["alpha"] = "YES"  # GDAL only tags band 4 as alpha at creation
+                    # Tag band 4 as alpha at creation. "Associated" alpha is the form most
+                    # non-GIS TIFF readers understand; with alpha only ever 0 or 255 (and
+                    # colour 0 where alpha is 0) the pixels are identical either way.
+                    profile["alpha"] = "PREMULTIPLIED"
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
             with rasterio.open(out, "w", **profile) as dst:
                 for r in range(0, h, 1024):
