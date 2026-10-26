@@ -1,0 +1,5 @@
+numpy
+rasterio
+laspy[lazrs]
+pyproj
+certifi

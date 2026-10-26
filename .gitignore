@@ -1,0 +1,10 @@
+# build outputs
+build/
+dist/
+build-log.txt
+
+# private Python/uv kept by run.bat and scripts\build.ps1
+.tools/
+
+__pycache__/
+*.pyc
