@@ -702,49 +702,25 @@ def process_obj(path, out, mode, offset, geoid, coords, check, log):
 
 
 # --------------------------------------------------------------------------
-# Simple export: one corrected elevation GeoTIFF + the orthophoto GeoTIFF,
-# optionally cropped so there are no black (nodata/transparent) edges.
+# Simple export: one corrected elevation GeoTIFF + the orthophoto GeoTIFF, trimmed
+# to the mapped area, with everything outside it marked as no-data (see-through).
 # --------------------------------------------------------------------------
 
-def _largest_rectangle(mask):
-    """Largest all-True axis-aligned rectangle in a 2-D bool array, as (r0, c0, r1, c1)."""
-    h, w = mask.shape
-    heights = np.zeros(w + 1, dtype=np.int64)  # trailing 0 flushes the stack each row
-    best = (0, 0, 0, 0, 0)
-    for r in range(h):
-        heights[:w] = np.where(mask[r], heights[:w] + 1, 0)
-        hl = heights.tolist()
-        stack = []  # (start column, height), heights increasing
-        for c, hc in enumerate(hl):
-            start = c
-            while stack and stack[-1][1] >= hc:
-                s, sh = stack.pop()
-                if sh * (c - s) > best[0]:
-                    best = (sh * (c - s), r - sh + 1, s, r + 1, c)
-                start = s
-            stack.append((start, hc))
-    return best[1:]
-
-
-def _valid_rect(read_mask, height, width, max_cells=600):
-    """Window of the largest fully-valid rectangle. read_mask(row0, nrows, ncols) -> bool array.
-
-    Works on blocks of k x k pixels; a block only counts as valid if every pixel is,
-    so the result never includes a nodata pixel.
-    """
+def _data_window(src):
+    """Smallest window holding every valid (non-transparent) pixel of a raster."""
     from rasterio.windows import Window
-    k = max(1, int(np.ceil(max(width, height) / max_cells)))
-    nr, nc = height // k, width // k
-    if nr == 0 or nc == 0:
+    rows = np.zeros(src.height, dtype=bool)
+    cols = np.zeros(src.width, dtype=bool)
+    for r in range(0, src.height, 1024):
+        n = min(1024, src.height - r)
+        m = src.dataset_mask(window=Window(0, r, src.width, n)) > 0
+        rows[r:r + n] = m.any(axis=1)
+        cols |= m.any(axis=0)
+    if not rows.any():
         return None
-    small = np.zeros((nr, nc), dtype=bool)
-    for i in range(nr):
-        m = np.asarray(read_mask(i * k, k, nc * k), dtype=bool)
-        small[i] = m.reshape(k, nc, k).all(axis=(0, 2))
-    r0, c0, r1, c1 = _largest_rectangle(small)
-    if r1 <= r0 or c1 <= c0:
-        return None
-    return Window(c0 * k, r0 * k, (c1 - c0) * k, (r1 - r0) * k)
+    r0, r1 = np.nonzero(rows)[0][[0, -1]]
+    c0, c1 = np.nonzero(cols)[0][[0, -1]]
+    return Window(int(c0), int(r0), int(c1 - c0 + 1), int(r1 - r0 + 1))
 
 
 def _overview_factors(width, height):
@@ -821,28 +797,37 @@ def _cloud_to_dem(path, bounds, out_crs, fallback_crs, max_cells=16_000_000):
     return dem, from_origin(xmin, ymax, res, res), out_crs, res
 
 
-def _write_ortho(src_path, out, win, drop_alpha):
+def _write_ortho(src_path, out, win):
+    """Copy the orthophoto window with the area outside the map marked as no-data twice over:
+    alpha = 0 (for programs that use transparency) and every band = 0 with nodata=0 (for
+    programs that only read the no-data value, which otherwise show the outside as black)."""
     import rasterio
-    from rasterio.enums import ColorInterp, Resampling
+    from rasterio.enums import Resampling
     from rasterio.windows import Window
     with rasterio.open(src_path) as src:
-        bands = list(range(1, src.count + 1))
-        if drop_alpha and src.count == 4 and src.colorinterp[3] == ColorInterp.alpha:
-            bands = bands[:3]  # nothing is transparent once the edges are cropped off
         w, h = int(win.width), int(win.height)
         profile = src.profile.copy()
-        profile.update(driver="GTiff", width=w, height=h, count=len(bands),
-                       transform=src.window_transform(win), tiled=True, blockxsize=512,
-                       blockysize=512, compress="deflate", predictor=2, BIGTIFF="IF_SAFER")
-        if len(bands) >= 3 and profile["dtype"] == "uint8":
-            profile["photometric"] = "RGB"
+        profile.update(driver="GTiff", width=w, height=h, transform=src.window_transform(win),
+                       tiled=True, blockxsize=512, blockysize=512, compress="deflate",
+                       predictor=2, BIGTIFF="IF_SAFER")
+        byte_rgb = src.count >= 3 and profile["dtype"] == "uint8"
+        if byte_rgb:
+            profile.update(photometric="RGB", nodata=0)
+            if src.count == 4 and src.colorinterp[3].name == "alpha":
+                profile["alpha"] = "YES"  # GDAL only tags band 4 as alpha at creation
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with rasterio.open(out, "w", **profile) as dst:
             for r in range(0, h, 1024):
                 n = min(1024, h - r)
                 sub = Window(win.col_off, win.row_off + r, w, n)
-                dst.write(src.read(bands, window=sub), window=Window(0, r, w, n))
-            dst.colorinterp = src.colorinterp[:len(bands)]
+                a = src.read(window=sub)
+                if byte_rgb:
+                    inside = src.dataset_mask(window=sub) > 0
+                    # real black pixels inside the map become 1 so they aren't read as no-data
+                    a[:, inside] = np.maximum(a[:, inside], 1)
+                    a[:, ~inside] = 0
+                dst.write(a, window=Window(0, r, w, n))
+            dst.colorinterp = src.colorinterp
             factors = _overview_factors(w, h)
             if factors:
                 dst.build_overviews(factors, Resampling.average)
@@ -864,13 +849,11 @@ def _write_dem(out, dem, transform, crs, note):
             dst.build_overviews(factors, Resampling.average)
 
 
-def export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, check, log):
+def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log):
     """Write '<name> - orthophoto.tif' and '<name> - DSM/DTM NZVD2016.tif'."""
     import rasterio
     from rasterio.transform import array_bounds
-    from rasterio.windows import Window
     from rasterio.windows import bounds as window_bounds
-    from rasterio.windows import transform as window_transform
     by_name = {os.path.basename(f).lower(): f for f in files}
     ortho = by_name.get("odm_orthophoto.tif")
     dem_path = by_name.get("dtm.tif") or by_name.get("dsm.tif")
@@ -881,19 +864,13 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, chec
     if ortho:
         with rasterio.open(ortho) as src:
             ortho_crs = src.crs
-            ortho_win = Window(0, 0, src.width, src.height)
-            if crop:
-                ortho_win = _valid_rect(
-                    lambda r0, n, w: src.dataset_mask(window=Window(0, r0, w, n)) > 0,
-                    src.height, src.width)
-                if ortho_win is None:
-                    raise FixError("The orthophoto has no area without gaps to crop to.")
+            ortho_win = _data_window(src)
+            if ortho_win is None:
+                raise FixError("The orthophoto is empty (every pixel is no-data).")
             bounds = window_bounds(ortho_win, src.transform)
             rx, ry = src.res
-            log(f"    orthophoto: {ortho_win.width * rx:.0f} x {ortho_win.height * ry:.0f} m"
-                + (" after cropping off the black edges" if crop else "")
-                + f" ({100 * ortho_win.width * ortho_win.height / (src.width * src.height):.0f}% "
-                  f"of the original image)")
+            log(f"    orthophoto: {ortho_win.width * rx:.0f} x {ortho_win.height * ry:.0f} m, "
+                f"area outside the map marked as no-data")
     else:
         log("    no orthophoto in the input - only the elevation model is exported")
 
@@ -911,13 +888,6 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, chec
         log("    no elevation model or point cloud in the input - no DEM exported")
 
     if dem is not None:
-        if crop and ortho is None:
-            ok = np.isfinite(dem)
-            win = _valid_rect(lambda r0, n, w: ok[r0:r0 + n, :w], *dem.shape)
-            if win is not None:
-                r0, c0 = int(win.row_off), int(win.col_off)
-                dem = dem[r0:r0 + int(win.height), c0:c0 + int(win.width)]
-                transform = window_transform(win, transform)
         valid = np.isfinite(dem)
         if valid.any():
             rows, cols = np.nonzero(valid)
@@ -932,7 +902,7 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, chec
         return
     if ortho:
         out = os.path.join(out_root, f"{name} - orthophoto.tif")
-        _write_ortho(ortho, out, ortho_win, drop_alpha=crop)
+        _write_ortho(ortho, out, ortho_win)
         log(f"    wrote {os.path.basename(out)}")
     if dem is not None:
         out = os.path.join(out_root, f"{name} - {kind} NZVD2016.tif")
@@ -941,7 +911,7 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, chec
 
 
 def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
-                    name="map", full=False, crop=True):
+                    name="map", full=False):
     """Returns {"offset": metres, "spread": metres} for automatic mode, else {}.
 
     Always exports the orthophoto and a corrected elevation model as GeoTIFFs; with
@@ -982,7 +952,7 @@ def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
         for path in rasters:
             with rasterio.open(path) as ds:
                 task_crs = task_crs or ds.crs
-    export_maps(files, out_root, name, mode, offset, geoid, task_crs, crop, check, log)
+    export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log)
     if not full:
         if not check:
             log("Done.")
@@ -1026,7 +996,7 @@ def _export_name(input_path):
 
 
 def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=False,
-        grid=None, log=print, full=False, crop=True):
+        grid=None, log=print, full=False):
     if mode not in ("auto", "geoid", "offset", "takeoff"):
         raise FixError(f"unknown mode {mode}")
     if mode == "takeoff" and takeoff is None:
@@ -1080,7 +1050,7 @@ def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=Fa
                 raise FixError("takeoff mode is for raw photos; use geoid or offset for WebODM outputs")
             log(f"Input looks like WebODM outputs. Mode: {mode}")
             return process_outputs(files, in_root, output_dir, mode, offset, geoid, check, log,
-                                   name=_export_name(input_path), full=full, crop=crop)
+                                   name=_export_name(input_path), full=full)
         else:
             photos = sorted(f for f in files if f.lower().endswith(PHOTO_EXTS))
             if not photos:
@@ -1153,7 +1123,6 @@ def gui():
     mode = tk.StringVar(value="auto")
     offset, takeoff = tk.StringVar(value="0"), tk.StringVar()
     advanced = tk.BooleanVar(value=False)
-    crop = tk.BooleanVar(value=True)
     full = tk.BooleanVar(value=False)
     status = tk.StringVar(value="Choose your WebODM all.zip to start.")
     suggested = {"out": ""}  # output folder we filled in, replaced when the input changes
@@ -1210,10 +1179,8 @@ def gui():
     ttk.Button(s2, text="Change...", command=pick_out_dir).grid(row=2, column=1)
     ttk.Label(s2, text="You'll get two GeoTIFFs: the orthophoto and an elevation model in NZVD2016.",
               style="Hint.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-    ttk.Checkbutton(s2, text="Crop off the black edges (keeps the largest rectangle with no gaps)",
-                    variable=crop).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
     ttk.Checkbutton(s2, text="Also export the point cloud and 3D model (.laz, .obj)",
-                    variable=full).grid(row=5, column=0, columnspan=2, sticky="w")
+                    variable=full).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     def suggest_output(*_):
         src = inp.get().strip().strip('"')
@@ -1331,7 +1298,7 @@ def gui():
         def work():
             try:
                 result = run(src, dst, mode.get(), off, tko, check,
-                             log=lambda m: q.put(("log", m)), full=full.get(), crop=crop.get())
+                             log=lambda m: q.put(("log", m)), full=full.get())
                 q.put(("done", (check, result or {}, dst)))
             except Exception as e:
                 q.put(("err", str(e) or e.__class__.__name__))
@@ -1399,15 +1366,13 @@ def main():
     ap.add_argument("--offset", type=float, default=0.0, help="metres to add (offset mode)")
     ap.add_argument("--takeoff-elev", type=float, help="takeoff ground height, m above sea level (takeoff mode)")
     ap.add_argument("--check", action="store_true", help="only report heights, write nothing")
-    ap.add_argument("--keep-edges", action="store_true",
-                    help="don't crop the exported GeoTIFFs to the gap-free area")
     ap.add_argument("--full", action="store_true",
                     help="also correct the point cloud, 3D model and WebODM's own DEMs")
     ap.add_argument("--grid", help=f"path to {GEOID_FILENAME} (downloaded automatically if omitted)")
     a = ap.parse_args()
     try:
         run(a.input, a.output, a.mode, a.offset, a.takeoff_elev, a.check, a.grid,
-            full=a.full, crop=not a.keep_edges)
+            full=a.full)
     except FixError as e:
         sys.exit(f"ERROR: {e}")
 

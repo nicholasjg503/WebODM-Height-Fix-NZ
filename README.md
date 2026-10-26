@@ -48,7 +48,7 @@ Two GeoTIFFs, ready for QGIS, ArcGIS or CAD:
 | `<name> - orthophoto.tif` | the orthophoto |
 | `<name> - DSM NZVD2016.tif` | the elevation model, with heights in metres above sea level (NZVD2016). If your WebODM task made a DTM (ground only), you get `DTM` instead. If it made no elevation model at all, one is built from the point cloud. |
 
-**Black edges:** WebODM maps have an irregular outline, and the empty area around it shows as black in many programs. By default, both files are cropped to the largest rectangle that has no gaps, so there are no black edges. If your flight was at an angle, that rectangle can be much smaller than the mapped area. Untick **Crop off the black edges** to keep the whole area instead. The edges are then transparent, not cropped.
+**No black edges:** your map has an irregular outline. WebODM marks the area around it as transparent, but many programs ignore that and show it as black. The exported orthophoto keeps all of the image, trims any empty margin, and marks the area outside the map as no-data in two ways: as transparency and as a no-data value. QGIS, ArcGIS, Global Mapper and CAD programs then show it as see-through instead of black. The elevation model uses the standard no-data value `-9999` outside the map.
 
 Tick **Also export the point cloud and 3D model** to get corrected copies of these files too:
 
