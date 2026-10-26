@@ -1,4 +1,4 @@
-# PyInstaller spec - builds dist\NZHeightFix\NZHeightFix.exe (one folder, no console).
+# PyInstaller spec - builds dist\WebODMHeightFixNZ\WebODMHeightFixNZ.exe (one folder, no console).
 # Run through scripts\build.ps1, which downloads the geoid grid into build\ first.
 import os
 
@@ -30,8 +30,8 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="NZHeightFix",
+    name="WebODMHeightFixNZ",
     icon=os.path.join(SPECPATH, "icon.ico"),
     console=False,
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="NZHeightFix")
+coll = COLLECT(exe, a.binaries, a.datas, name="WebODMHeightFixNZ")

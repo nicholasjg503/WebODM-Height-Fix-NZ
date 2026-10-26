@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NZ Height Fix - convert drone photos or WebODM outputs to NZVD2016 heights
+WebODM Height Fix NZ - convert drone photos or WebODM outputs to NZVD2016 heights
 (height above mean sea level, New Zealand).
 
 Two kinds of input:
@@ -39,8 +39,13 @@ import zipfile
 import numpy as np
 
 __version__ = "1.0.0"
-APP_NAME = "NZ Height Fix"
-HELP_URL = "https://github.com/nicholasjg503/nz-height-fix#readme"
+APP_NAME = "WebODM Height Fix NZ"
+HELP_URL = "https://github.com/nicholasjg503/WebODM-Height-Fix-NZ#readme"
+
+DEFAULT_CRS = "EPSG:2105"  # NZGD2000 / Mount Eden 2000
+# Choices for the exports: NZTM, the 28 NZGD2000 meridional circuits, or WebODM's own UTM (None)
+EXPORT_CRS = [("EPSG:2193", "NZGD2000 / New Zealand Transverse Mercator 2000")] + [
+    (f"EPSG:{c}", None) for c in range(2105, 2133)]
 
 GEOID_FILENAME = "nz_linz_nzgeoid2016.tif"
 GEOID_URL = "https://cdn.proj.org/" + GEOID_FILENAME
@@ -153,6 +158,10 @@ class DeltaField:
 
     def __init__(self, mode, offset, geoid, crs, xmin, ymin, xmax, ymax):
         self.const = None
+        self.align = None
+        if mode == "align":  # offset is an Alignment fitted against LINZ
+            self.align = offset
+            return
         if mode == "offset":
             self.const = float(offset)
             return
@@ -171,6 +180,8 @@ class DeltaField:
     def __call__(self, x, y):
         x = np.asarray(x, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
+        if self.align is not None:
+            return self.align.dz(x, y)
         if self.const is not None:
             return np.full(np.broadcast(x, y).shape, self.const)
         fx = np.clip((x - self.xs[0]) / (self.xs[-1] - self.xs[0]) * (len(self.xs) - 1), 0, len(self.xs) - 1)
@@ -183,6 +194,8 @@ class DeltaField:
                 + g[y0 + 1, x0] * (1 - tx) * ty + g[y0 + 1, x0 + 1] * tx * ty)
 
     def summary(self):
+        if self.align is not None:
+            return self.align.summary()
         if self.const is not None:
             return f"{self.const:+.3f} m"
         return f"{self.grid.min():+.3f} to {self.grid.max():+.3f} m"
@@ -322,6 +335,195 @@ def linz_offset(path, kind, log, fallback_crs=None):
         log("    WARNING: large spread - the ground may have changed since the LiDAR survey, "
             "or the model is tilted/distorted. Check the result.")
     return med, mad
+
+
+# --------------------------------------------------------------------------
+# Full alignment to LINZ 1 m LiDAR: horizontal shift + height plane fitted on
+# stable open ground, so real change (e.g. slips since the LiDAR) stands out.
+# --------------------------------------------------------------------------
+
+def _linz_mosaic(coll, bbox, res=1.0):
+    """A LINZ layer over an NZTM2000 bbox as (heights with NaN, transform), or None."""
+    import rasterio
+    from rasterio.errors import RasterioIOError
+    from rasterio.transform import from_origin
+    xmin, ymin = np.floor(bbox[0] / res) * res, np.floor(bbox[1] / res) * res
+    xmax, ymax = np.ceil(bbox[2] / res) * res, np.ceil(bbox[3] / res) * res
+    w, h = int(round((xmax - xmin) / res)), int(round((ymax - ymin) / res))
+    out = np.full((h, w), np.nan)
+    sheets = {topo50_sheet(x, y) for x in np.linspace(xmin, xmax, 6)
+              for y in np.linspace(ymin, ymax, 6)} - {None}
+    with rasterio.Env(**_gdal_env()):
+        for sheet in sorted(sheets):
+            try:
+                with rasterio.open(f"/vsicurl/{LINZ_ELEVATION}{coll}/{sheet}.tiff") as ds:
+                    nd = ds.nodata if ds.nodata is not None else -9999.0
+                    a = ds.read(1, window=ds.window(xmin, ymin, xmax, ymax), out_shape=(h, w),
+                                boundless=True, fill_value=nd).astype(np.float64)
+            except RasterioIOError:
+                continue  # no tile here (sea / no coverage)
+            a[a == nd] = np.nan
+            take = np.isnan(out) & np.isfinite(a)
+            out[take] = a[take]
+    if not np.isfinite(out).any():
+        return None
+    return out, from_origin(xmin, ymax, res, res)
+
+
+def _bilinear(grid, x, y):
+    """Sample a (array, transform) grid at map coordinates; NaN outside or next to no-data."""
+    a, T = grid
+    c, r = ~T * (np.asarray(x, dtype=np.float64), np.asarray(y, dtype=np.float64))
+    c, r = np.asarray(c) - 0.5, np.asarray(r) - 0.5  # pixel centres
+    h, w = a.shape
+    c0, r0 = np.floor(c).astype(np.int64), np.floor(r).astype(np.int64)
+    ok = (c0 >= 0) & (r0 >= 0) & (c0 < w - 1) & (r0 < h - 1)
+    out = np.full(c.shape, np.nan)
+    c0, r0 = c0[ok], r0[ok]
+    fc, fr = c[ok] - c0, r[ok] - r0
+    out[ok] = (a[r0, c0] * (1 - fc) * (1 - fr) + a[r0, c0 + 1] * fc * (1 - fr)
+               + a[r0 + 1, c0] * (1 - fc) * fr + a[r0 + 1, c0 + 1] * fc * fr)
+    return out
+
+
+def _flat_mask(a):
+    """Cells whose 3x3 neighbourhood is dead flat: LINZ hydro-flattens water surfaces."""
+    p = np.pad(a, 1, constant_values=np.nan)
+    h, w = a.shape
+    stack = np.stack([p[i:i + h, j:j + w] for i in range(3) for j in range(3)])
+    with np.errstate(invalid="ignore"):
+        return (np.nanmax(stack, axis=0) - np.nanmin(stack, axis=0)) < 0.01
+
+
+def _surface_samples(path, fallback_crs, cell=1.0, target=60000):
+    """(x, y, z) samples of a WebODM surface on a ~1 m grid (to match LINZ), plus CRS."""
+    import rasterio
+    from affine import Affine
+    from rasterio.enums import Resampling
+    if path.lower().endswith((".laz", ".las")):
+        a, T, crs, _ = _cloud_to_dem(path, None, None, fallback_crs, res=cell)
+    else:
+        with rasterio.open(path) as src:
+            k = max(1.0, cell / abs(src.res[0]))
+            shape = (max(1, int(src.height / k)), max(1, int(src.width / k)))
+            a = src.read(1, out_shape=shape, resampling=Resampling.average,
+                         masked=True).astype(np.float64).filled(np.nan)
+            T = src.transform * Affine.scale(src.width / shape[1], src.height / shape[0])
+            crs = src.crs
+    if crs is None:
+        raise FixError(f"{os.path.basename(path)} has no coordinate system.")
+    rows, cols = np.nonzero(np.isfinite(a))
+    if len(rows) > target:
+        pick = np.random.default_rng(0).choice(len(rows), target, replace=False)
+        rows, cols = rows[pick], cols[pick]
+    x, y = T * (cols + 0.5, rows + 0.5)
+    return np.asarray(x), np.asarray(y), a[rows, cols], crs
+
+
+class Alignment:
+    """Moves a WebODM model onto LINZ: shift by (dx, dy) metres in the model's coordinate
+    system, and add a height correction plane defined on the original (unshifted) coordinates."""
+
+    def __init__(self, dx, dy, x0, y0, coef, spread, size, linz):
+        self.dx, self.dy, self.x0, self.y0 = dx, dy, x0, y0
+        self.coef, self.spread, self.size, self.linz = coef, spread, size, linz
+
+    def dz(self, x, y):
+        a, b, c = self.coef
+        return -(a * (np.asarray(x) - self.x0) + b * (np.asarray(y) - self.y0) + c)
+
+    @property
+    def offset(self):
+        return -float(self.coef[2])
+
+    @property
+    def tilt(self):
+        return float(np.hypot(self.coef[0], self.coef[1]) * self.size)
+
+    def summary(self):
+        return (f"{self.offset:+.3f} m (tilt {self.tilt:.2f} m across the site), "
+                f"moved {self.dx:+.1f} m east, {self.dy:+.1f} m north")
+
+
+def linz_align(path, kind, log, fallback_crs=None):
+    """Fit an Alignment of this DSM/DTM/point cloud to LINZ 1 m LiDAR, or None without LiDAR."""
+    from pyproj import Transformer
+    x, y, z, crs = _surface_samples(path, fallback_crs)
+    if len(z) < 200:
+        raise FixError(f"{os.path.basename(path)} has too few valid heights to compare.")
+    to_nztm = Transformer.from_crs(crs, "EPSG:2193", always_xy=True)
+    X, Y = (np.asarray(v) for v in to_nztm.transform(x, y))
+    cx, cy = float(x.mean()), float(y.mean())
+    tx, ty = to_nztm.transform([cx, cx + 1, cx], [cy, cy, cy + 1])
+    J = np.array([[tx[1] - tx[0], tx[2] - tx[0]], [ty[1] - ty[0], ty[2] - ty[0]]])
+
+    log(f"    comparing {os.path.basename(path)} with LINZ 1 m LiDAR ...")
+    bbox = (X.min() - 15, Y.min() - 15, X.max() + 15, Y.max() + 15)
+    dsm = _linz_mosaic("new-zealand/dsm_1m/2193", bbox)
+    dem = _linz_mosaic("new-zealand/dem_1m/2193", bbox)
+    if dsm is None or dem is None:
+        log("    no LINZ 1 m LiDAR here")
+        return None
+    flat = (_flat_mask(dem[0]).astype(np.float64), dem[1])
+    ref = dem if kind == "dtm" else dsm
+
+    def sample(grid, dx, dy):
+        sx, sy = J @ (dx, dy)
+        return _bilinear(grid, X + sx, Y + sy)
+
+    land = _bilinear(flat, X, Y) < 0.5  # not water (NaN compares False, so no-data drops out)
+
+    def score(dx, dy):
+        r = z - sample(ref, dx, dy)
+        r = r[land & np.isfinite(r)]
+        return np.median(np.abs(r - np.median(r))) if len(r) >= 200 else np.inf
+
+    # horizontal shift: coarse then fine search for the best match of the shapes
+    s0 = score(0.0, 0.0)
+    best = min((score(dx, dy), dx, dy) for dx in np.arange(-5, 5.01, 0.5)
+               for dy in np.arange(-5, 5.01, 0.5))
+    best = min((score(dx, dy), dx, dy) for dx in np.arange(best[1] - 0.5, best[1] + 0.51, 0.1)
+               for dy in np.arange(best[2] - 0.5, best[2] + 0.51, 0.1))
+    dx, dy = (round(float(best[1]), 1), round(float(best[2]), 1)) if best[0] < 0.9 * s0 else (0.0, 0.0)
+    if dx or dy:
+        log(f"    horizontal: moved {np.hypot(dx, dy):.1f} m ({dx:+.1f} m east, {dy:+.1f} m north) "
+            f"to line up with LINZ")
+    else:
+        log("    horizontal: already lines up with LINZ, not moved")
+
+    # height: robust plane on stable open ground (LINZ DSM ~ DEM = no trees/buildings);
+    # cells that changed since the LiDAR (slips, earthworks) are rejected as outliers
+    r = z - sample(ref, dx, dy)
+    open_ = land & np.isfinite(r) & (np.abs(sample(dsm, dx, dy) - sample(dem, dx, dy)) < 0.3)
+    if open_.sum() < 200:
+        log("    not much open ground - fitting heights to all land instead")
+        open_ = land & np.isfinite(r)
+    if open_.sum() < 50:
+        return None
+    A = np.c_[x - cx, y - cy, np.ones_like(x)]
+    inl = open_.copy()
+    for _ in range(20):
+        coef = np.linalg.lstsq(A[inl], r[inl], rcond=None)[0]
+        res = r - A @ coef
+        sig = 1.4826 * np.median(np.abs(res[inl]))
+        new = open_ & (np.abs(res) < max(3 * sig, 0.3))
+        if (new == inl).all():
+            break
+        inl = new
+    spread = float(np.median(np.abs(res[inl])))
+    size = float(max(np.ptp(x), np.ptp(y)))
+    al = Alignment(dx, dy, cx, cy, coef, spread, size,
+                   {"dsm": dsm, "dem": dem, "flat": flat, "kind": kind})
+    stable = inl.sum() / open_.sum()
+    log(f"    vertical: {al.offset:+.2f} m, tilt {al.tilt:.2f} m across {size:.0f} m, "
+        f"fitted on {inl.sum():,} open-ground cells ({100 * stable:.0f}% matched LINZ, "
+        f"typical misfit +/-{spread:.2f} m)")
+    if stable < 0.6:
+        log("    WARNING: a lot of the open ground differs from LINZ (big slip or earthworks?). "
+            "Check the change map.")
+    if al.tilt > 1.0:
+        log("    WARNING: the model is noticeably tilted - ground control points would help.")
+    return al
 
 
 # --------------------------------------------------------------------------
@@ -599,10 +801,13 @@ def process_raster(path, out, mode, offset, geoid, check, log):
         log(f"    correction {field.summary()}")
         if check:
             return field
+        from affine import Affine
+        dx, dy = _shift(mode, offset)
         profile = src.profile.copy()
-        profile.update(driver="GTiff", BIGTIFF="IF_SAFER")
+        profile.update(driver="GTiff", BIGTIFF="IF_SAFER",
+                       transform=Affine.translation(dx, dy) * src.transform)
         nodata = src.nodata
-        T = src.transform
+        T = src.transform  # heights are corrected at the original positions
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with rasterio.open(out, "w", **profile) as dst:
             step = 1024
@@ -618,9 +823,13 @@ def process_raster(path, out, mode, offset, geoid, check, log):
                         valid &= a != nodata
                     a[valid] += field(xs[valid], ys[valid])
                     dst.write(a.astype(profile["dtype"]), 1, window=win)
-            dst.update_tags(VERTICAL_DATUM="NZVD2016" if mode == "geoid" else
-                            f"heights shifted {offset:+.3f} m")
+            dst.update_tags(VERTICAL_DATUM="NZVD2016", NOTE=f"corrected {field.summary()}")
     return field
+
+
+def _shift(mode, offset):
+    """Horizontal (dx, dy) to move outputs by: only an Alignment to LINZ moves them."""
+    return (offset.dx, offset.dy) if mode == "align" else (0.0, 0.0)
 
 
 def process_pointcloud(path, out, mode, offset, geoid, fallback_crs, check, log):
@@ -637,11 +846,14 @@ def process_pointcloud(path, out, mode, offset, geoid, fallback_crs, check, log)
         log(f"    {h.point_count:,} points, correction {field.summary()}")
         if check:
             return field
+        dx, dy = _shift(mode, offset)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with laspy.open(out, mode="w", header=h) as writer:
             for pts in reader.chunk_iterator(2_000_000):
                 x, y = np.asarray(pts.x), np.asarray(pts.y)
                 pts.z = np.asarray(pts.z) + field(x, y)
+                if dx or dy:
+                    pts.x, pts.y = x + dx, y + dy
                 writer.write_points(pts)
     return field
 
@@ -671,12 +883,14 @@ def process_obj(path, out, mode, offset, geoid, coords, check, log):
     if check:
         return
 
+    sx, sy = _shift(mode, offset)
+
     def flush(batch, fout):
         xyz = np.array([[float(v) for v in ln.split()[1:4]] for ln in batch])
         dz = field(xyz[:, 0] + ox, xyz[:, 1] + oy)
-        for ln, z in zip(batch, xyz[:, 2] + dz):
+        for ln, (x, y, z) in zip(batch, np.c_[xyz[:, 0] + sx, xyz[:, 1] + sy, xyz[:, 2] + dz]):
             p = ln.split()
-            p[3] = f"{z:.6f}"
+            p[1:4] = (f"{x:.6f}", f"{y:.6f}", f"{z:.6f}")
             fout.write(" ".join(p) + "\n")
         batch.clear()
 
@@ -741,7 +955,16 @@ def _read_dem(path, bounds):
         return a, src.window_transform(win), src.crs
 
 
-def _cloud_to_dem(path, bounds, out_crs, fallback_crs, max_cells=16_000_000):
+def _box_mean(a, k):
+    """Mean of a 2-D array over a k x k window (k odd), edges padded with zeros."""
+    p = k // 2
+    c = np.pad(a, p).cumsum(0).cumsum(1)
+    c = np.pad(c, ((1, 0), (1, 0)))
+    h, w = a.shape
+    return (c[k:k + h, k:k + w] - c[:h, k:k + w] - c[k:k + h, :w] + c[:h, :w]) / (k * k)
+
+
+def _cloud_to_dem(path, bounds, out_crs, fallback_crs, res=None, max_cells=16_000_000):
     """Grid a point cloud into a surface model (mean height per cell), filling small holes.
 
     Returns (heights with NaN for no data, transform, crs, cell size).
@@ -766,7 +989,7 @@ def _cloud_to_dem(path, bounds, out_crs, fallback_crs, max_cells=16_000_000):
             bounds = (h.mins[0], h.mins[1], h.maxs[0], h.maxs[1])
         xmin, ymin, xmax, ymax = bounds
         density = h.point_count / max(1.0, (h.maxs[0] - h.mins[0]) * (h.maxs[1] - h.mins[1]))
-        res = max(0.05, np.sqrt(4.0 / density),  # about 4 points per cell
+        res = max(res or 0.05, np.sqrt(4.0 / density) if res is None else 0,  # ~4 points a cell
                   np.sqrt((xmax - xmin) * (ymax - ymin) / max_cells))
         res = float(np.ceil(res * 100) / 100)
         nx = max(1, int(np.ceil((xmax - xmin) / res)))
@@ -787,7 +1010,10 @@ def _cloud_to_dem(path, bounds, out_crs, fallback_crs, max_cells=16_000_000):
     has = counts > 0
     dem[has] = sums[has] / counts[has]
     dem = dem.reshape(ny, nx)
-    valid = np.isfinite(dem)
+    # drop stray cells at the ragged edge of the model: keep only cells where most of the
+    # surrounding ~7x7 cells have points too
+    valid = np.isfinite(dem) & (_box_mean(np.isfinite(dem).astype(np.float64), 7) >= 0.5)
+    dem[~valid] = np.nan
     # fill gaps up to ~10 cells from real data; anything further stays nodata
     filled = fillnodata(np.where(valid, dem, 0).astype(np.float32), mask=valid.astype(np.uint8),
                         max_search_distance=10)
@@ -797,40 +1023,104 @@ def _cloud_to_dem(path, bounds, out_crs, fallback_crs, max_cells=16_000_000):
     return dem, from_origin(xmin, ymax, res, res), out_crs, res
 
 
-def _write_ortho(src_path, out, win):
-    """Copy the orthophoto window with the area outside the map marked as no-data twice over:
-    alpha = 0 (for programs that use transparency) and every band = 0 with nodata=0 (for
-    programs that only read the no-data value, which otherwise show the outside as black)."""
+def _write_ortho(src_path, out, move, out_crs):
+    """Write the orthophoto, moved by the `move` affine and reprojected to out_crs if given,
+    trimmed to the mapped area. Outside the map is marked as no-data twice over: alpha = 0
+    (for programs that use transparency) and every band = 0 with nodata=0 (for programs that
+    only read the no-data value, which otherwise show the outside as black)."""
     import rasterio
-    from rasterio.enums import Resampling
+    from affine import Affine
+    from pyproj import CRS
+    from rasterio.enums import ColorInterp, Resampling
+    from rasterio.vrt import WarpedVRT
     from rasterio.windows import Window
     with rasterio.open(src_path) as src:
-        w, h = int(win.width), int(win.height)
-        profile = src.profile.copy()
-        profile.update(driver="GTiff", width=w, height=h, transform=src.window_transform(win),
-                       tiled=True, blockxsize=512, blockysize=512, compress="deflate",
-                       predictor=2, BIGTIFF="IF_SAFER")
-        byte_rgb = src.count >= 3 and profile["dtype"] == "uint8"
-        if byte_rgb:
-            profile.update(photometric="RGB", nodata=0)
-            if src.count == 4 and src.colorinterp[3].name == "alpha":
-                profile["alpha"] = "YES"  # GDAL only tags band 4 as alpha at creation
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        with rasterio.open(out, "w", **profile) as dst:
-            for r in range(0, h, 1024):
-                n = min(1024, h - r)
-                sub = Window(win.col_off, win.row_off + r, w, n)
-                a = src.read(window=sub)
-                if byte_rgb:
-                    inside = src.dataset_mask(window=sub) > 0
-                    # real black pixels inside the map become 1 so they aren't read as no-data
-                    a[:, inside] = np.maximum(a[:, inside], 1)
-                    a[:, ~inside] = 0
-                dst.write(a, window=Window(0, r, w, n))
-            dst.colorinterp = src.colorinterp
-            factors = _overview_factors(w, h)
-            if factors:
-                dst.build_overviews(factors, Resampling.average)
+        has_alpha = src.count == 4 and src.colorinterp[3].name == "alpha"
+        if out_crs is None or CRS.from_user_input(out_crs) == CRS.from_user_input(src.crs):
+            ds, transform0 = src, move * src.transform
+        else:
+            alpha = {"src_alpha": 4, "dst_alpha": 4} if has_alpha else {"add_alpha": True}
+            ds = WarpedVRT(src, src_transform=move * src.transform, crs=out_crs,
+                           resampling=Resampling.bilinear, **alpha)
+            transform0 = ds.transform
+            has_alpha = True
+        try:
+            win = _data_window(ds)
+            if win is None:
+                raise FixError("The orthophoto is empty (every pixel is no-data).")
+            w, h = int(win.width), int(win.height)
+            col0, row0 = int(win.col_off), int(win.row_off)
+            byte_rgb = ds.count >= 3 and ds.dtypes[0] == "uint8"
+            profile = dict(driver="GTiff", width=w, height=h, count=ds.count, dtype=ds.dtypes[0],
+                           crs=ds.crs, transform=transform0 * Affine.translation(col0, row0),
+                           tiled=True, blockxsize=512, blockysize=512, compress="deflate",
+                           predictor=2, BIGTIFF="IF_SAFER")
+            if byte_rgb:
+                profile.update(photometric="RGB", nodata=0)
+                if has_alpha:
+                    profile["alpha"] = "YES"  # GDAL only tags band 4 as alpha at creation
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            with rasterio.open(out, "w", **profile) as dst:
+                for r in range(0, h, 1024):
+                    n = min(1024, h - r)
+                    sub = Window(col0, row0 + r, w, n)
+                    a = ds.read(window=sub)
+                    if byte_rgb:
+                        inside = ds.dataset_mask(window=sub) > 127
+                        # real black pixels inside the map become 1 so they aren't no-data
+                        a[:, inside] = np.maximum(a[:, inside], 1)
+                        a[:, ~inside] = 0
+                        if has_alpha:
+                            a[3] = np.where(inside, 255, 0)  # crisp edge after resampling
+                    dst.write(a, window=Window(0, r, w, n))
+                if has_alpha:
+                    dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue,
+                                       ColorInterp.alpha)
+                factors = _overview_factors(w, h)
+                if factors:
+                    dst.build_overviews(factors, Resampling.average)
+        finally:
+            if ds is not src:
+                ds.close()
+
+
+def _write_png_copy(tif, png):
+    """Transparent PNG of an RGBA GeoTIFF, placed by a .pgw world file and .prj, for CAD
+    programs (BricsCAD, AutoCAD) that ignore GeoTIFF no-data and transparency."""
+    import rasterio
+    from pyproj import CRS
+    from pyproj.enums import WktVersion
+    with rasterio.open(tif) as src:
+        a = src.read()
+        if src.count == 3:
+            a = np.concatenate([a, (src.dataset_mask() > 0)[None].astype(np.uint8) * 255])
+        T, crs = src.transform, src.crs
+    with rasterio.Env(GDAL_PAM_ENABLED="NO"):  # no .aux.xml clutter
+        with rasterio.open(png, "w", driver="PNG", width=a.shape[2], height=a.shape[1],
+                           count=4, dtype="uint8") as dst:
+            dst.write(a[:4])
+    base = os.path.splitext(png)[0]
+    with open(base + ".pgw", "w") as f:  # world file: centre of the top-left pixel
+        f.write("\n".join(f"{v:.10f}" for v in (T.a, T.d, T.b, T.e, T.c + T.a / 2 + T.b / 2,
+                                                T.f + T.d / 2 + T.e / 2)) + "\n")
+    with open(base + ".prj", "w") as f:
+        f.write(CRS.from_user_input(crs).to_wkt(WktVersion.WKT1_ESRI))
+
+
+def _warp_array(a, transform, crs, dst_crs):
+    """Reproject a float grid (NaN = no data) to dst_crs at about the same cell size."""
+    from rasterio.enums import Resampling
+    from rasterio.transform import array_bounds
+    from rasterio.warp import calculate_default_transform, reproject
+    h, w = a.shape
+    west, south, east, north = array_bounds(h, w, transform)
+    T2, w2, h2 = calculate_default_transform(crs, dst_crs, w, h, west, south, east, north,
+                                             resolution=abs(transform.a))
+    out = np.full((h2, w2), np.nan)
+    reproject(a, out, src_transform=transform, src_crs=crs, src_nodata=np.nan,
+              dst_transform=T2, dst_crs=dst_crs, dst_nodata=np.nan,
+              resampling=Resampling.bilinear)
+    return out, T2
 
 
 def _write_dem(out, dem, transform, crs, note):
@@ -849,9 +1139,11 @@ def _write_dem(out, dem, transform, crs, note):
             dst.build_overviews(factors, Resampling.average)
 
 
-def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log):
-    """Write '<name> - orthophoto.tif' and '<name> - DSM/DTM NZVD2016.tif'."""
+def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log, out_crs=None):
+    """Write '<name> - orthophoto.tif', '<name> - DSM/DTM NZVD2016.tif' and, when aligned to
+    LINZ, '<name> - change since LINZ (m).tif'."""
     import rasterio
+    from affine import Affine
     from rasterio.transform import array_bounds
     from rasterio.windows import bounds as window_bounds
     by_name = {os.path.basename(f).lower(): f for f in files}
@@ -869,8 +1161,8 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
                 raise FixError("The orthophoto is empty (every pixel is no-data).")
             bounds = window_bounds(ortho_win, src.transform)
             rx, ry = src.res
-            log(f"    orthophoto: {ortho_win.width * rx:.0f} x {ortho_win.height * ry:.0f} m, "
-                f"area outside the map marked as no-data")
+            log(f"    orthophoto: {ortho_win.width * rx:.0f} x {ortho_win.height * ry:.0f} m at "
+                f"{rx * 100:.0f} cm, area outside the map marked as no-data")
     else:
         log("    no orthophoto in the input - only the elevation model is exported")
 
@@ -895,23 +1187,69 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
             west, south, east, north = array_bounds(dem.shape[0], dem.shape[1], transform)
             field = DeltaField(mode, offset, geoid, dem_crs, west, south, east, north)
             dem[rows, cols] += field(np.asarray(xs), np.asarray(ys))
-        log(f"    elevation model ({kind}): {dem.shape[1]} x {dem.shape[0]} cells, "
-            f"{100 * valid.mean():.0f}% with data")
+        log(f"    elevation model ({kind}): {dem.shape[1]} x {dem.shape[0]} cells at "
+            f"{abs(transform.a):.2f} m, {100 * valid.mean():.0f}% with data")
+
+    # Everything above is in WebODM's own coordinates; the alignment's horizontal shift is
+    # applied when writing, by moving each file's georeferencing (no resampling).
+    al = offset if mode == "align" else None
+    move = Affine.translation(al.dx, al.dy) if al else Affine.identity()
+    change = None
+    if al is not None and dem is not None and dem_crs is not None:
+        change = _change_since_linz(dem, move * transform, dem_crs, al, kind, log)
 
     if check:
         return
+    from pyproj import CRS
+    crs_name = CRS.from_user_input(out_crs or dem_crs or ortho_crs).name
+    log(f"    coordinate system: {crs_name}")
     if ortho:
         out = os.path.join(out_root, f"{name} - orthophoto.tif")
-        _write_ortho(ortho, out, ortho_win)
-        log(f"    wrote {os.path.basename(out)}")
+        _write_ortho(ortho, out, move, out_crs)
+        _write_png_copy(out, out[:-4] + ".png")
+        log(f"    wrote {os.path.basename(out)} and a transparent .png (+ .pgw/.prj) for CAD")
+    grids = []
     if dem is not None:
-        out = os.path.join(out_root, f"{name} - {kind} NZVD2016.tif")
-        _write_dem(out, dem, transform, dem_crs, note)
-        log(f"    wrote {os.path.basename(out)}")
+        grids.append((f"{name} - {kind} NZVD2016.tif", dem, note))
+    if change is not None:
+        grids.append((f"{name} - change since LINZ (m).tif", change,
+                      f"this survey's {kind} minus LINZ 1 m LiDAR "
+                      f"{'DEM' if kind == 'DTM' else 'DSM'}; negative = ground lower now"))
+    for fn, grid, gnote in grids:
+        T, crs = move * transform, dem_crs
+        if out_crs is not None and CRS.from_user_input(out_crs) != CRS.from_user_input(crs):
+            grid, T = _warp_array(grid, T, crs, out_crs)
+            crs = out_crs
+        _write_dem(os.path.join(out_root, fn), grid, T, crs, gnote)
+        log(f"    wrote {fn}")
+
+
+def _change_since_linz(dem, transform, crs, al, kind, log):
+    """This survey minus the LINZ LiDAR it was aligned to, on the survey's grid (NaN on water)."""
+    from pyproj import Transformer
+    h, w = dem.shape
+    rows, cols = np.mgrid[0:h, 0:w]
+    x, y = transform * (cols.ravel() + 0.5, rows.ravel() + 0.5)
+    X, Y = Transformer.from_crs(crs, "EPSG:2193", always_xy=True).transform(x, y)
+    ref = _bilinear(al.linz["dem" if kind == "DTM" else "dsm"], X, Y).reshape(h, w)
+    water = (_bilinear(al.linz["flat"], X, Y) >= 0.5).reshape(h, w)
+    change = np.where(water, np.nan, dem - ref)
+    ok = np.isfinite(change)
+    if not ok.any():
+        return None
+    cell = abs(transform.a * transform.e)
+    down, up = ok & (change < -0.5), ok & (change > 0.5)
+    log(f"    change since LINZ LiDAR ({ok.sum() * cell:,.0f} m2 compared): "
+        f"{down.sum() * cell:,.0f} m2 lower by > 0.5 m ({change[down].sum() * cell:,.0f} m3), "
+        f"{up.sum() * cell:,.0f} m2 higher by > 0.5 m (+{change[up].sum() * cell:,.0f} m3)")
+    if kind == "DSM":
+        log("    note: this is a surface model, so trees and buildings count as change too. "
+            "For slips, turn on DTM in WebODM.")
+    return change
 
 
 def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
-                    name="map", full=False):
+                    name="map", full=False, out_crs=None):
     """Returns {"offset": metres, "spread": metres} for automatic mode, else {}.
 
     Always exports the orthophoto and a corrected elevation model as GeoTIFFs; with
@@ -939,11 +1277,18 @@ def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
         else:
             raise FixError("Automatic mode needs dtm.tif, dsm.tif or the point cloud (.laz) "
                            "in the WebODM outputs.")
-        log(f"Finding offset from {os.path.basename(ref)}:")
-        offset, spread = linz_offset(ref, kind, log, task_crs)
-        result = {"offset": offset, "spread": spread}
-        mode = "offset"
-        log(f"Applying {offset:+.2f} m to all outputs.")
+        log(f"Lining up {os.path.basename(ref)} with LINZ:")
+        al = linz_align(ref, kind, log, task_crs)
+        if al is not None:
+            result = {"offset": al.offset, "spread": al.spread, "shift": (al.dx, al.dy),
+                      "tilt": al.tilt}
+            mode, offset = "align", al
+            log(f"Applying to all outputs: heights {al.summary()}.")
+        else:  # no 1 m LiDAR: fall back to a single height offset from the 8 m model
+            offset, spread = linz_offset(ref, kind, log, task_crs)
+            result = {"offset": offset, "spread": spread}
+            mode = "offset"
+            log(f"Applying {offset:+.2f} m to all outputs.")
 
     if not (rasters or clouds or objs):
         raise FixError("No WebODM outputs (dsm.tif, dtm.tif, .laz, _geo.obj) found.")
@@ -952,7 +1297,7 @@ def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
         for path in rasters:
             with rasterio.open(path) as ds:
                 task_crs = task_crs or ds.crs
-    export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log)
+    export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log, out_crs)
     if not full:
         if not check:
             log("Done.")
@@ -996,7 +1341,7 @@ def _export_name(input_path):
 
 
 def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=False,
-        grid=None, log=print, full=False):
+        grid=None, log=print, full=False, out_crs=None):
     if mode not in ("auto", "geoid", "offset", "takeoff"):
         raise FixError(f"unknown mode {mode}")
     if mode == "takeoff" and takeoff is None:
@@ -1050,7 +1395,7 @@ def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=Fa
                 raise FixError("takeoff mode is for raw photos; use geoid or offset for WebODM outputs")
             log(f"Input looks like WebODM outputs. Mode: {mode}")
             return process_outputs(files, in_root, output_dir, mode, offset, geoid, check, log,
-                                   name=_export_name(input_path), full=full)
+                                   name=_export_name(input_path), full=full, out_crs=out_crs)
         else:
             photos = sorted(f for f in files if f.lower().endswith(PHOTO_EXTS))
             if not photos:
@@ -1076,8 +1421,17 @@ def _describe_result(result, check, out_dir):
         msg = (f"Your heights are {abs(off):.2f} m too {'low' if off > 0 else 'high'}. "
                f"Click \"Fix heights\" to correct them.")
     else:
-        msg = (f"Done! Heights were {'raised' if off > 0 else 'lowered'} by {abs(off):.2f} m.\n"
-               f"Corrected files are in: {out_dir}")
+        msg = f"Done! Heights were {'raised' if off > 0 else 'lowered'} by {abs(off):.2f} m"
+        dx, dy = result.get("shift", (0, 0))
+        if dx or dy:
+            msg += f" and the map moved {np.hypot(dx, dy):.1f} m sideways to line up with LINZ"
+        msg += f".\nCorrected files are in: {out_dir}"
+    if check and any(result.get("shift", (0, 0))):
+        msg += (f"\nThe map is also {np.hypot(*result['shift']):.1f} m out sideways - "
+                "that gets fixed too.")
+    if result.get("tilt", 0) > 1.0:
+        msg += (f"\nNote: the model was tilted by about {result['tilt']:.1f} m across the site "
+                "(corrected). Ground control points would make it more reliable.")
     if warn:
         msg += (f"\nWarning: the match varies by about +/-{spread:.1f} m across the site. The ground "
                 "may have changed since LINZ's survey, or the model may be tilted. Check the result.")
@@ -1099,7 +1453,7 @@ def gui():
 
     root = tk.Tk()
     root.title(f"{APP_NAME} {__version__}")
-    root.geometry("820x760")
+    root.geometry("840x800")
     root.minsize(680, 560)
     try:
         root.iconbitmap(_resource("icon.ico"))
@@ -1124,6 +1478,9 @@ def gui():
     offset, takeoff = tk.StringVar(value="0"), tk.StringVar()
     advanced = tk.BooleanVar(value=False)
     full = tk.BooleanVar(value=False)
+    from pyproj import CRS
+    crs_choices = [(code, f"{name or CRS.from_user_input(code).name}  ({code})")
+                   for code, name in EXPORT_CRS] + [(None, "Same as WebODM (UTM)")]
     status = tk.StringVar(value="Choose your WebODM all.zip to start.")
     suggested = {"out": ""}  # output folder we filled in, replaced when the input changes
 
@@ -1177,10 +1534,18 @@ def gui():
             outp.set(os.path.normpath(p))
 
     ttk.Button(s2, text="Change...", command=pick_out_dir).grid(row=2, column=1)
-    ttk.Label(s2, text="You'll get two GeoTIFFs: the orthophoto and an elevation model in NZVD2016.",
+    ttk.Label(s2, text="You'll get the orthophoto (GeoTIFF + transparent PNG for CAD), an elevation "
+                       "model in NZVD2016, and a map of change since the LINZ LiDAR.",
               style="Hint.TLabel").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    cf = ttk.Frame(s2)
+    cf.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    ttk.Label(cf, text="Coordinate system:").pack(side="left")
+    crs_combo = ttk.Combobox(cf, values=[label for _, label in crs_choices], state="readonly",
+                             width=58)
+    crs_combo.current(next(i for i, (code, _) in enumerate(crs_choices) if code == DEFAULT_CRS))
+    crs_combo.pack(side="left", padx=(6, 0))
     ttk.Checkbutton(s2, text="Also export the point cloud and 3D model (.laz, .obj)",
-                    variable=full).grid(row=4, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                    variable=full).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     def suggest_output(*_):
         src = inp.get().strip().strip('"')
@@ -1294,11 +1659,13 @@ def gui():
                    "Fixing heights... (this usually takes a minute or two)")
         status_lbl.configure(style="Status.TLabel")
         logbox.delete("1.0", "end")
+        out_crs = crs_choices[crs_combo.current()][0]
 
         def work():
             try:
                 result = run(src, dst, mode.get(), off, tko, check,
-                             log=lambda m: q.put(("log", m)), full=full.get())
+                             log=lambda m: q.put(("log", m)), full=full.get(),
+                             out_crs=out_crs)
                 q.put(("done", (check, result or {}, dst)))
             except Exception as e:
                 q.put(("err", str(e) or e.__class__.__name__))
@@ -1366,13 +1733,17 @@ def main():
     ap.add_argument("--offset", type=float, default=0.0, help="metres to add (offset mode)")
     ap.add_argument("--takeoff-elev", type=float, help="takeoff ground height, m above sea level (takeoff mode)")
     ap.add_argument("--check", action="store_true", help="only report heights, write nothing")
+    ap.add_argument("--crs", default=DEFAULT_CRS,
+                    help="coordinate system for the exported GeoTIFFs/PNG, e.g. EPSG:2193 for "
+                         "NZTM 2000, or 'webodm' to keep WebODM's UTM (default EPSG:2105, "
+                         "Mount Eden 2000)")
     ap.add_argument("--full", action="store_true",
                     help="also correct the point cloud, 3D model and WebODM's own DEMs")
     ap.add_argument("--grid", help=f"path to {GEOID_FILENAME} (downloaded automatically if omitted)")
     a = ap.parse_args()
     try:
         run(a.input, a.output, a.mode, a.offset, a.takeoff_elev, a.check, a.grid,
-            full=a.full)
+            full=a.full, out_crs=None if a.crs.lower() == "webodm" else a.crs)
     except FixError as e:
         sys.exit(f"ERROR: {e}")
 

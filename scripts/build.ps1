@@ -1,11 +1,11 @@
-# Builds dist\NZHeightFix\ (the app) and, if Inno Setup 6 is installed,
-# dist\NZHeightFix-Setup-<version>.exe (the installer). Used locally and by GitHub Actions.
+# Builds dist\WebODMHeightFixNZ\ (the app) and, if Inno Setup 6 is installed,
+# dist\WebODM-Height-Fix-NZ-Setup-<version>.exe (the installer). Used locally and by GitHub Actions.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 $version = (Select-String -Path nz_height_fix.py -Pattern '^__version__ = "(.+)"').Matches[0].Groups[1].Value
-Write-Host "Building NZ Height Fix $version"
+Write-Host "Building WebODM Height Fix NZ $version"
 
 $uv = & (Join-Path $PSScriptRoot 'get-uv.ps1')
 
@@ -25,7 +25,7 @@ if ($LASTEXITCODE -ne 0) { throw 'PyInstaller failed' }
 $ErrorActionPreference = 'Stop'
 
 # Smoke test: the frozen app must load GDAL, PROJ, LAZ support and the bundled geoid grid
-$p = Start-Process dist\NZHeightFix\NZHeightFix.exe -ArgumentList '--selftest' -Wait -PassThru
+$p = Start-Process dist\WebODMHeightFixNZ\WebODMHeightFixNZ.exe -ArgumentList '--selftest' -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "Built app failed its self-test (exit code $($p.ExitCode))" }
 Write-Host 'Built app passed its self-test.'
 
@@ -37,7 +37,7 @@ $iscc = @(
 if ($iscc) {
     & $iscc /Q "/DAppVersion=$version" packaging\installer.iss
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
-    Write-Host "Installer: dist\NZHeightFix-Setup-$version.exe"
+    Write-Host "Installer: dist\WebODM-Height-Fix-NZ-Setup-$version.exe"
 } else {
-    Write-Host 'Inno Setup 6 not found - skipped the installer. The app is in dist\NZHeightFix\.'
+    Write-Host 'Inno Setup 6 not found - skipped the installer. The app is in dist\WebODMHeightFixNZ\.'
 }

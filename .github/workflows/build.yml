@@ -38,13 +38,13 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NZHeightFix-Setup
-          path: dist/NZHeightFix-Setup-*.exe
+          name: WebODM-Height-Fix-NZ-Setup
+          path: dist/WebODM-Height-Fix-NZ-Setup-*.exe
           if-no-files-found: error
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/NZHeightFix-Setup-*.exe
+          files: dist/WebODM-Height-Fix-NZ-Setup-*.exe
           generate_release_notes: true
