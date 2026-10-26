@@ -15,7 +15,7 @@ For WebODM / OpenDroneMap projects in <b>New Zealand</b>.
 
 Ordinary (non-RTK) drones are good at measuring how high they are *above where they took off*, but bad at knowing how high that is above sea level. Their "absolute" altitude is often tens or even hundreds of metres out. So your WebODM elevation models, point clouds and 3D models come out at the wrong height.
 
-WebODM Height Fix NZ lines your map up with **LINZ's national 1 m LiDAR** (which is in NZVD2016, New Zealand's official height system). It corrects the height, any tilt, and the few metres of horizontal GPS error, then exports everything in your local coordinate system. You don't need to know your takeoff height or have ground control points.
+WebODM Height Fix NZ lines your map's heights up with **LINZ's national 1 m LiDAR**, which is in NZVD2016, New Zealand's official height system. It corrects the height and any tilt, then exports everything in your local coordinate system. Horizontal positions are left as WebODM made them. You don't need to know your takeoff height or have ground control points.
 
 It also makes a **change map** showing your survey minus the LiDAR, so you can see ground that has moved since LINZ flew it, such as slips, slumps and earthworks.
 
@@ -41,8 +41,7 @@ It needs an internet connection, because it reads the LINZ elevation data for yo
 
 ### How the lining up works
 
-1. **Sideways:** it slides your map around to find where its shape best matches the LiDAR. This fixes the 1–3 m horizontal error typical of drones without RTK.
-2. **Height and tilt:** it fits a gently sloping height correction to **stable open ground** only: roads, lawns and paddocks, where LINZ's surface and ground models agree. Trees and buildings are left out, and so is water, which LINZ flattens. Ground that has **changed since the LiDAR**, such as a slip, doesn't match. It's detected and left out of the fit, so it can't drag the correction with it.
+It fits a gently sloping height correction to **stable open ground** only: roads, lawns and paddocks, where LINZ's surface and ground models agree. Trees and buildings are left out, and so is water, which LINZ flattens. Ground that has **changed since the LiDAR**, such as a slip, doesn't match. It's detected and left out of the fit, so it can't drag the correction with it.
 
 The **Details** box shows what was found. Tested on a real site, open ground ended up within ±0.5 m of LINZ for 84% of the area, compared with 21% for a simple height shift.
 
@@ -72,7 +71,7 @@ Tick **Also export the point cloud and 3D model** to get corrected copies of the
 | `odm_dem/dsm.tif`, `odm_dem/dtm.tif` (WebODM's own elevation models, uncropped) | ✅ |
 | `.glb` 3D model, web viewer tiles | ❌ Not corrected. Use the `.obj` instead. |
 
-**Your original files are never changed.** These extra files are moved, levelled and tilted the same way, but they stay in WebODM's UTM coordinate system.
+**Your original files are never changed.** These extra files are levelled and tilted the same way, but they stay in WebODM's UTM coordinate system.
 
 ## Advanced options
 
@@ -92,7 +91,7 @@ There's also a command-line version: run `WebODMHeightFixNZ.exe --help` from the
 
 **I need Auckland Vertical Datum 1946 (AVD-46), or another local datum.** That isn't supported. The output is always NZVD2016.
 
-**Does it change horizontal positions?** Yes, in Automatic mode. Everything is moved by the shift that best lines up with the LiDAR, usually 1–3 m. The other modes only change heights.
+**Does it change horizontal positions?** No. Only heights change, apart from reprojecting into the coordinate system you pick. A drone without RTK is typically 1–3 m out horizontally. For precise horizontal positions, use ground control points.
 
 **How accurate is the change map?** On stable ground it's typically within ±0.3–0.5 m. Treat differences smaller than about 0.5 m with caution. The LiDAR may be a few years old, and trees, buildings and water always show up as differences in a DSM.
 

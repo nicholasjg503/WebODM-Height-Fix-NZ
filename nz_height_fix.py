@@ -338,8 +338,8 @@ def linz_offset(path, kind, log, fallback_crs=None):
 
 
 # --------------------------------------------------------------------------
-# Full alignment to LINZ 1 m LiDAR: horizontal shift + height plane fitted on
-# stable open ground, so real change (e.g. slips since the LiDAR) stands out.
+# Height alignment to LINZ 1 m LiDAR: a height plane fitted on stable open ground,
+# so real change (e.g. slips since the LiDAR) stands out.
 # --------------------------------------------------------------------------
 
 def _linz_mosaic(coll, bbox, res=1.0):
@@ -421,11 +421,11 @@ def _surface_samples(path, fallback_crs, cell=1.0, target=60000):
 
 
 class Alignment:
-    """Moves a WebODM model onto LINZ: shift by (dx, dy) metres in the model's coordinate
-    system, and add a height correction plane defined on the original (unshifted) coordinates."""
+    """Height correction plane that puts a WebODM model onto LINZ. Horizontal positions are
+    left as WebODM made them."""
 
-    def __init__(self, dx, dy, x0, y0, coef, spread, size, linz):
-        self.dx, self.dy, self.x0, self.y0 = dx, dy, x0, y0
+    def __init__(self, x0, y0, coef, spread, size, linz):
+        self.x0, self.y0 = x0, y0
         self.coef, self.spread, self.size, self.linz = coef, spread, size, linz
 
     def dz(self, x, y):
@@ -441,8 +441,7 @@ class Alignment:
         return float(np.hypot(self.coef[0], self.coef[1]) * self.size)
 
     def summary(self):
-        return (f"{self.offset:+.3f} m (tilt {self.tilt:.2f} m across the site), "
-                f"moved {self.dx:+.1f} m east, {self.dy:+.1f} m north")
+        return f"{self.offset:+.3f} m (tilt {self.tilt:.2f} m across the site)"
 
 
 def linz_align(path, kind, log, fallback_crs=None):
@@ -454,8 +453,6 @@ def linz_align(path, kind, log, fallback_crs=None):
     to_nztm = Transformer.from_crs(crs, "EPSG:2193", always_xy=True)
     X, Y = (np.asarray(v) for v in to_nztm.transform(x, y))
     cx, cy = float(x.mean()), float(y.mean())
-    tx, ty = to_nztm.transform([cx, cx + 1, cx], [cy, cy, cy + 1])
-    J = np.array([[tx[1] - tx[0], tx[2] - tx[0]], [ty[1] - ty[0], ty[2] - ty[0]]])
 
     log(f"    comparing {os.path.basename(path)} with LINZ 1 m LiDAR ...")
     bbox = (X.min() - 15, Y.min() - 15, X.max() + 15, Y.max() + 15)
@@ -467,34 +464,12 @@ def linz_align(path, kind, log, fallback_crs=None):
     flat = (_flat_mask(dem[0]).astype(np.float64), dem[1])
     ref = dem if kind == "dtm" else dsm
 
-    def sample(grid, dx, dy):
-        sx, sy = J @ (dx, dy)
-        return _bilinear(grid, X + sx, Y + sy)
-
     land = _bilinear(flat, X, Y) < 0.5  # not water (NaN compares False, so no-data drops out)
-
-    def score(dx, dy):
-        r = z - sample(ref, dx, dy)
-        r = r[land & np.isfinite(r)]
-        return np.median(np.abs(r - np.median(r))) if len(r) >= 200 else np.inf
-
-    # horizontal shift: coarse then fine search for the best match of the shapes
-    s0 = score(0.0, 0.0)
-    best = min((score(dx, dy), dx, dy) for dx in np.arange(-5, 5.01, 0.5)
-               for dy in np.arange(-5, 5.01, 0.5))
-    best = min((score(dx, dy), dx, dy) for dx in np.arange(best[1] - 0.5, best[1] + 0.51, 0.1)
-               for dy in np.arange(best[2] - 0.5, best[2] + 0.51, 0.1))
-    dx, dy = (round(float(best[1]), 1), round(float(best[2]), 1)) if best[0] < 0.9 * s0 else (0.0, 0.0)
-    if dx or dy:
-        log(f"    horizontal: moved {np.hypot(dx, dy):.1f} m ({dx:+.1f} m east, {dy:+.1f} m north) "
-            f"to line up with LINZ")
-    else:
-        log("    horizontal: already lines up with LINZ, not moved")
 
     # height: robust plane on stable open ground (LINZ DSM ~ DEM = no trees/buildings);
     # cells that changed since the LiDAR (slips, earthworks) are rejected as outliers
-    r = z - sample(ref, dx, dy)
-    open_ = land & np.isfinite(r) & (np.abs(sample(dsm, dx, dy) - sample(dem, dx, dy)) < 0.3)
+    r = z - _bilinear(ref, X, Y)
+    open_ = land & np.isfinite(r) & (np.abs(_bilinear(dsm, X, Y) - _bilinear(dem, X, Y)) < 0.3)
     if open_.sum() < 200:
         log("    not much open ground - fitting heights to all land instead")
         open_ = land & np.isfinite(r)
@@ -512,8 +487,7 @@ def linz_align(path, kind, log, fallback_crs=None):
         inl = new
     spread = float(np.median(np.abs(res[inl])))
     size = float(max(np.ptp(x), np.ptp(y)))
-    al = Alignment(dx, dy, cx, cy, coef, spread, size,
-                   {"dsm": dsm, "dem": dem, "flat": flat, "kind": kind})
+    al = Alignment(cx, cy, coef, spread, size, {"dsm": dsm, "dem": dem, "flat": flat})
     stable = inl.sum() / open_.sum()
     log(f"    vertical: {al.offset:+.2f} m, tilt {al.tilt:.2f} m across {size:.0f} m, "
         f"fitted on {inl.sum():,} open-ground cells ({100 * stable:.0f}% matched LINZ, "
@@ -801,13 +775,10 @@ def process_raster(path, out, mode, offset, geoid, check, log):
         log(f"    correction {field.summary()}")
         if check:
             return field
-        from affine import Affine
-        dx, dy = _shift(mode, offset)
         profile = src.profile.copy()
-        profile.update(driver="GTiff", BIGTIFF="IF_SAFER",
-                       transform=Affine.translation(dx, dy) * src.transform)
+        profile.update(driver="GTiff", BIGTIFF="IF_SAFER")
         nodata = src.nodata
-        T = src.transform  # heights are corrected at the original positions
+        T = src.transform
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with rasterio.open(out, "w", **profile) as dst:
             step = 1024
@@ -827,11 +798,6 @@ def process_raster(path, out, mode, offset, geoid, check, log):
     return field
 
 
-def _shift(mode, offset):
-    """Horizontal (dx, dy) to move outputs by: only an Alignment to LINZ moves them."""
-    return (offset.dx, offset.dy) if mode == "align" else (0.0, 0.0)
-
-
 def process_pointcloud(path, out, mode, offset, geoid, fallback_crs, check, log):
     import laspy
     with laspy.open(path) as reader:
@@ -846,14 +812,11 @@ def process_pointcloud(path, out, mode, offset, geoid, fallback_crs, check, log)
         log(f"    {h.point_count:,} points, correction {field.summary()}")
         if check:
             return field
-        dx, dy = _shift(mode, offset)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with laspy.open(out, mode="w", header=h) as writer:
             for pts in reader.chunk_iterator(2_000_000):
                 x, y = np.asarray(pts.x), np.asarray(pts.y)
                 pts.z = np.asarray(pts.z) + field(x, y)
-                if dx or dy:
-                    pts.x, pts.y = x + dx, y + dy
                 writer.write_points(pts)
     return field
 
@@ -883,14 +846,12 @@ def process_obj(path, out, mode, offset, geoid, coords, check, log):
     if check:
         return
 
-    sx, sy = _shift(mode, offset)
-
     def flush(batch, fout):
         xyz = np.array([[float(v) for v in ln.split()[1:4]] for ln in batch])
         dz = field(xyz[:, 0] + ox, xyz[:, 1] + oy)
-        for ln, (x, y, z) in zip(batch, np.c_[xyz[:, 0] + sx, xyz[:, 1] + sy, xyz[:, 2] + dz]):
+        for ln, z in zip(batch, xyz[:, 2] + dz):
             p = ln.split()
-            p[1:4] = (f"{x:.6f}", f"{y:.6f}", f"{z:.6f}")
+            p[3] = f"{z:.6f}"
             fout.write(" ".join(p) + "\n")
         batch.clear()
 
@@ -1023,9 +984,9 @@ def _cloud_to_dem(path, bounds, out_crs, fallback_crs, res=None, max_cells=16_00
     return dem, from_origin(xmin, ymax, res, res), out_crs, res
 
 
-def _write_ortho(src_path, out, move, out_crs):
-    """Write the orthophoto, moved by the `move` affine and reprojected to out_crs if given,
-    trimmed to the mapped area. Outside the map is marked as no-data twice over: alpha = 0
+def _write_ortho(src_path, out, out_crs):
+    """Write the orthophoto, reprojected to out_crs if given, trimmed to the mapped area.
+    Outside the map is marked as no-data twice over: alpha = 0
     (for programs that use transparency) and every band = 0 with nodata=0 (for programs that
     only read the no-data value, which otherwise show the outside as black)."""
     import rasterio
@@ -1037,11 +998,10 @@ def _write_ortho(src_path, out, move, out_crs):
     with rasterio.open(src_path) as src:
         has_alpha = src.count == 4 and src.colorinterp[3].name == "alpha"
         if out_crs is None or CRS.from_user_input(out_crs) == CRS.from_user_input(src.crs):
-            ds, transform0 = src, move * src.transform
+            ds, transform0 = src, src.transform
         else:
             alpha = {"src_alpha": 4, "dst_alpha": 4} if has_alpha else {"add_alpha": True}
-            ds = WarpedVRT(src, src_transform=move * src.transform, crs=out_crs,
-                           resampling=Resampling.bilinear, **alpha)
+            ds = WarpedVRT(src, crs=out_crs, resampling=Resampling.bilinear, **alpha)
             transform0 = ds.transform
             has_alpha = True
         try:
@@ -1146,7 +1106,6 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
     """Write '<name> - orthophoto.tif', '<name> - DSM/DTM NZVD2016.tif' and, when aligned to
     LINZ, '<name> - change since LINZ (m).tif'."""
     import rasterio
-    from affine import Affine
     from rasterio.transform import array_bounds
     from rasterio.windows import bounds as window_bounds
     by_name = {os.path.basename(f).lower(): f for f in files}
@@ -1193,13 +1152,10 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
         log(f"    elevation model ({kind}): {dem.shape[1]} x {dem.shape[0]} cells at "
             f"{abs(transform.a):.2f} m, {100 * valid.mean():.0f}% with data")
 
-    # Everything above is in WebODM's own coordinates; the alignment's horizontal shift is
-    # applied when writing, by moving each file's georeferencing (no resampling).
     al = offset if mode == "align" else None
-    move = Affine.translation(al.dx, al.dy) if al else Affine.identity()
     change = None
     if al is not None and dem is not None and dem_crs is not None:
-        change = _change_since_linz(dem, move * transform, dem_crs, al, kind, log)
+        change = _change_since_linz(dem, transform, dem_crs, al, kind, log)
 
     if check:
         return
@@ -1208,7 +1164,7 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
     log(f"    coordinate system: {crs_name}")
     if ortho:
         out = os.path.join(out_root, f"{name} - orthophoto.tif")
-        _write_ortho(ortho, out, move, out_crs)
+        _write_ortho(ortho, out, out_crs)
         _write_png_copy(out, out[:-4] + ".png")
         log(f"    wrote {os.path.basename(out)} and a transparent .png (+ .pgw/.prj) for CAD")
     grids = []
@@ -1219,7 +1175,7 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
                       f"this survey's {kind} minus LINZ 1 m LiDAR "
                       f"{'DEM' if kind == 'DTM' else 'DSM'}; negative = ground lower now"))
     for fn, grid, gnote in grids:
-        T, crs = move * transform, dem_crs
+        T, crs = transform, dem_crs
         if out_crs is not None and CRS.from_user_input(out_crs) != CRS.from_user_input(crs):
             grid, T = _warp_array(grid, T, crs, out_crs)
             crs = out_crs
@@ -1283,8 +1239,7 @@ def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
         log(f"Lining up {os.path.basename(ref)} with LINZ:")
         al = linz_align(ref, kind, log, task_crs)
         if al is not None:
-            result = {"offset": al.offset, "spread": al.spread, "shift": (al.dx, al.dy),
-                      "tilt": al.tilt}
+            result = {"offset": al.offset, "spread": al.spread, "tilt": al.tilt}
             mode, offset = "align", al
             log(f"Applying to all outputs: heights {al.summary()}.")
         else:  # no 1 m LiDAR: fall back to a single height offset from the 8 m model
@@ -1424,14 +1379,8 @@ def _describe_result(result, check, out_dir):
         msg = (f"Your heights are {abs(off):.2f} m too {'low' if off > 0 else 'high'}. "
                f"Click \"Fix heights\" to correct them.")
     else:
-        msg = f"Done! Heights were {'raised' if off > 0 else 'lowered'} by {abs(off):.2f} m"
-        dx, dy = result.get("shift", (0, 0))
-        if dx or dy:
-            msg += f" and the map moved {np.hypot(dx, dy):.1f} m sideways to line up with LINZ"
-        msg += f".\nCorrected files are in: {out_dir}"
-    if check and any(result.get("shift", (0, 0))):
-        msg += (f"\nThe map is also {np.hypot(*result['shift']):.1f} m out sideways - "
-                "that gets fixed too.")
+        msg = (f"Done! Heights were {'raised' if off > 0 else 'lowered'} by {abs(off):.2f} m.\n"
+               f"Corrected files are in: {out_dir}")
     if result.get("tilt", 0) > 1.0:
         msg += (f"\nNote: the model was tilted by about {result['tilt']:.1f} m across the site "
                 "(corrected). Ground control points would make it more reliable.")
