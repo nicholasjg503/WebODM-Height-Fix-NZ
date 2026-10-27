@@ -11,7 +11,7 @@ datas = [
     (os.path.join(root, "build", "nz_linz_nzgeoid2016.tif"), "."),  # works offline for geoid mode
 ]
 binaries, hiddenimports = [], []
-for pkg in ("rasterio", "pyproj", "laspy", "lazrs", "certifi"):
+for pkg in ("rasterio", "pyproj", "laspy", "lazrs", "certifi", "ezdxf"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

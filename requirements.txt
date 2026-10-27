@@ -3,3 +3,5 @@ rasterio
 laspy[lazrs]
 pyproj
 certifi
+scipy
+ezdxf

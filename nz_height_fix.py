@@ -421,11 +421,15 @@ def _surface_samples(path, fallback_crs, cell=1.0, target=60000):
 
 
 class Alignment:
-    """Height correction plane that puts a WebODM model onto LINZ. Horizontal positions are
-    left as WebODM made them."""
+    """Height correction plane that puts a WebODM model onto LINZ.
 
-    def __init__(self, x0, y0, coef, spread, size, linz):
-        self.x0, self.y0 = x0, y0
+    Horizontal positions are left as WebODM made them. (dx, dy) is how far the model sits from
+    LINZ sideways: it's only used to compare like with like - LINZ is sampled at the matching
+    spot - because on a slope a 2 m sideways offset alone looks like ~1 m of height change.
+    """
+
+    def __init__(self, x0, y0, coef, spread, size, linz, dx=0.0, dy=0.0):
+        self.x0, self.y0, self.dx, self.dy = x0, y0, dx, dy
         self.coef, self.spread, self.size, self.linz = coef, spread, size, linz
 
     def dz(self, x, y):
@@ -453,6 +457,13 @@ def linz_align(path, kind, log, fallback_crs=None):
     to_nztm = Transformer.from_crs(crs, "EPSG:2193", always_xy=True)
     X, Y = (np.asarray(v) for v in to_nztm.transform(x, y))
     cx, cy = float(x.mean()), float(y.mean())
+    tx, ty = to_nztm.transform([cx, cx + 1, cx], [cy, cy, cy + 1])
+    J = np.array([[tx[1] - tx[0], tx[2] - tx[0]], [ty[1] - ty[0], ty[2] - ty[0]]])
+
+    def at(grid, dx=0.0, dy=0.0):
+        """A LINZ grid at the sample points, offset (dx, dy) m in the model's coordinates."""
+        sx, sy = J @ (dx, dy)
+        return _bilinear(grid, X + sx, Y + sy)
 
     log(f"    comparing {os.path.basename(path)} with LINZ 1 m LiDAR ...")
     bbox = (X.min() - 15, Y.min() - 15, X.max() + 15, Y.max() + 15)
@@ -464,17 +475,36 @@ def linz_align(path, kind, log, fallback_crs=None):
     flat = (_flat_mask(dem[0]).astype(np.float64), dem[1])
     ref = dem if kind == "dtm" else dsm
 
-    land = _bilinear(flat, X, Y) < 0.5  # not water (NaN compares False, so no-data drops out)
+    land = at(flat) < 0.5  # not water (NaN compares False, so no-data drops out)
+    open_ = land & np.isfinite(z - at(ref)) & (np.abs(at(dsm) - at(dem)) < 0.3)
+    if open_.sum() < 200:
+        log("    not much open ground - fitting heights to all land instead")
+        open_ = land & np.isfinite(z - at(ref))
+    if open_.sum() < 50:
+        return None
+
+    # how far the model sits sideways from LINZ, measured on open ground only (trees and
+    # buildings change shape between surveys). Not applied to any output - only used so the
+    # comparisons below are made at matching spots.
+    def score(dx, dy):
+        r_ = (z - at(ref, dx, dy))[open_]
+        r_ = r_[np.isfinite(r_)]
+        return np.median(np.abs(r_ - np.median(r_))) if len(r_) >= 200 else np.inf
+    s0 = score(0.0, 0.0)
+    best = min((score(dx, dy), dx, dy) for dx in np.arange(-4, 4.01, 0.5)
+               for dy in np.arange(-4, 4.01, 0.5))
+    best = min((score(dx, dy), dx, dy) for dx in np.arange(best[1] - 0.4, best[1] + 0.41, 0.2)
+               for dy in np.arange(best[2] - 0.4, best[2] + 0.41, 0.2))
+    dx, dy = (round(float(best[1]), 1), round(float(best[2]), 1)) if best[0] < 0.85 * s0 else (0.0, 0.0)
+    if dx or dy:
+        log(f"    sideways: the model sits {np.hypot(dx, dy):.1f} m from LINZ ({-dx:+.1f} m east, "
+            f"{-dy:+.1f} m north of it). Your files aren't moved - LINZ is just compared at the "
+            "matching spot, so slopes don't show false change.")
 
     # height: robust plane on stable open ground (LINZ DSM ~ DEM = no trees/buildings);
     # cells that changed since the LiDAR (slips, earthworks) are rejected as outliers
-    r = z - _bilinear(ref, X, Y)
-    open_ = land & np.isfinite(r) & (np.abs(_bilinear(dsm, X, Y) - _bilinear(dem, X, Y)) < 0.3)
-    if open_.sum() < 200:
-        log("    not much open ground - fitting heights to all land instead")
-        open_ = land & np.isfinite(r)
-    if open_.sum() < 50:
-        return None
+    r = z - at(ref, dx, dy)
+    open_ &= np.isfinite(r)
     A = np.c_[x - cx, y - cy, np.ones_like(x)]
     inl = open_.copy()
     for _ in range(20):
@@ -487,7 +517,7 @@ def linz_align(path, kind, log, fallback_crs=None):
         inl = new
     spread = float(np.median(np.abs(res[inl])))
     size = float(max(np.ptp(x), np.ptp(y)))
-    al = Alignment(cx, cy, coef, spread, size, {"dsm": dsm, "dem": dem, "flat": flat})
+    al = Alignment(cx, cy, coef, spread, size, {"dsm": dsm, "dem": dem, "flat": flat}, dx, dy)
     stable = inl.sum() / open_.sum()
     log(f"    vertical: {al.offset:+.2f} m, tilt {al.tilt:.2f} m across {size:.0f} m, "
         f"fitted on {inl.sum():,} open-ground cells ({100 * stable:.0f}% matched LINZ, "
@@ -902,18 +932,44 @@ def _overview_factors(width, height):
     return [f for f in (2, 4, 8, 16, 32, 64) if min(width, height) // f >= 256]
 
 
-def _read_dem(path, bounds):
-    """Elevation raster (NaN for nodata), its transform and CRS, limited to bounds if given."""
+def _read_dem(path, bounds, cell=None):
+    """Elevation raster (NaN for nodata), its transform and CRS, limited to bounds if given.
+
+    With `cell` (metres) coarser than the file, cells are averaged down to that size as they
+    are read - a 5 cm WebODM DTM is otherwise tens of millions of cells.
+    """
     import rasterio
+    from affine import Affine
+    from rasterio.enums import Resampling
     from rasterio.windows import Window
     with rasterio.open(path) as src:
         full = Window(0, 0, src.width, src.height)
         win = full if bounds is None else \
             src.window(*bounds).round_offsets().round_lengths().intersection(full)
+        res = abs(src.res[0])
+        if cell and cell > res * 1.01:
+            shape = (max(1, int(round(win.height * res / cell))),
+                     max(1, int(round(win.width * res / cell))))
+            a = src.read(1, window=win, out_shape=shape, resampling=Resampling.average,
+                         masked=True).astype(np.float64).filled(np.nan)
+            T = src.window_transform(win) * Affine.scale(win.width / shape[1],
+                                                         win.height / shape[0])
+            return a, T, src.crs
         a = src.read(1, window=win).astype(np.float64)
         if src.nodata is not None:
             a[a == src.nodata] = np.nan
         return a, src.window_transform(win), src.crs
+
+
+def _to_grid(a, src_transform, src_crs, dst_transform, dst_shape, dst_crs, method="bilinear"):
+    """Resample a float grid (NaN = no data) onto another grid, with GDAL doing the work."""
+    from rasterio.enums import Resampling
+    from rasterio.warp import reproject
+    out = np.full(dst_shape, np.nan)
+    reproject(np.asarray(a, dtype=np.float64), out, src_transform=src_transform, src_crs=src_crs,
+              src_nodata=np.nan, dst_transform=dst_transform, dst_crs=dst_crs,
+              dst_nodata=np.nan, resampling=getattr(Resampling, method))
+    return out
 
 
 def _box_mean(a, k):
@@ -1102,9 +1158,13 @@ def _write_dem(out, dem, transform, crs, note):
             dst.build_overviews(factors, Resampling.average)
 
 
-def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log, out_crs=None):
+def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log, out_crs=None,
+                cell=0.25, detect=True):
     """Write '<name> - orthophoto.tif', '<name> - DSM/DTM NZVD2016.tif' and, when aligned to
-    LINZ, '<name> - change since LINZ (m).tif'."""
+    LINZ, '<name> - change since LINZ (m).tif' plus the detected change areas.
+
+    `cell` is the elevation model's cell size in metres (None keeps WebODM's). Returns a dict
+    of what was found (for the window's summary)."""
     import rasterio
     from rasterio.transform import array_bounds
     from rasterio.windows import bounds as window_bounds
@@ -1128,13 +1188,20 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
     else:
         log("    no orthophoto in the input - only the elevation model is exported")
 
+    dsm = None
     if dem_path:
         kind = "DTM" if os.path.basename(dem_path).lower() == "dtm.tif" else "DSM"
-        dem, transform, dem_crs = _read_dem(dem_path, bounds)
+        dem, transform, dem_crs = _read_dem(dem_path, bounds, cell)
         note = f"from WebODM {os.path.basename(dem_path)}"
+        if kind == "DTM" and "dsm.tif" in by_name and mode == "align":
+            # WebODM's surface model on the same grid: shows trees/buildings now, and is the true
+            # ground wherever the ground is bare (see below)
+            d, dT, dcrs = _read_dem(by_name["dsm.tif"], bounds, cell)
+            dsm = _to_grid(d, dT, dcrs, transform, dem.shape, dem_crs, "average")
+            del d
     elif clouds:
         kind = "DSM"
-        dem, transform, dem_crs, res = _cloud_to_dem(clouds[0], bounds, ortho_crs, task_crs)
+        dem, transform, dem_crs, res = _cloud_to_dem(clouds[0], bounds, ortho_crs, task_crs, res=cell)
         note = "gridded from the WebODM point cloud"
         log(f"    no DEM in the input - built a {res:.2f} m surface model (DSM) from the point cloud")
     else:
@@ -1149,16 +1216,45 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
             west, south, east, north = array_bounds(dem.shape[0], dem.shape[1], transform)
             field = DeltaField(mode, offset, geoid, dem_crs, west, south, east, north)
             dem[rows, cols] += field(np.asarray(xs), np.asarray(ys))
+            if dsm is not None:
+                ok = np.isfinite(dsm)
+                r2, c2 = np.nonzero(ok)
+                x2, y2 = transform * (c2 + 0.5, r2 + 0.5)
+                dsm[r2, c2] += field(np.asarray(x2), np.asarray(y2))
         log(f"    elevation model ({kind}): {dem.shape[1]} x {dem.shape[0]} cells at "
             f"{abs(transform.a):.2f} m, {100 * valid.mean():.0f}% with data")
 
     al = offset if mode == "align" else None
-    change = None
+    change = det = None
+    summary = {}
     if al is not None and dem is not None and dem_crs is not None:
-        change = _change_since_linz(dem, transform, dem_crs, al, kind, log)
+        if dsm is not None and ortho:
+            # WebODM's ground filter tends to cut steep bare faces (slip scarps, batters) out of
+            # the DTM. Where the orthophoto shows bare ground, the surface model is the ground,
+            # so use it - except on buildings that were already there when LINZ flew.
+            bare = np.nan_to_num(_bare_ground(ortho, transform, dem.shape, dem_crs)) > 0.5
+            then = (_linz_grid(al, "dsm", transform, dem.shape, dem_crs)
+                    - _linz_grid(al, "dem", transform, dem.shape, dem_crs))
+            with np.errstate(invalid="ignore"):
+                use = bare & np.isfinite(dsm) & ~(((dsm - dem) > 2.5) & (then > 2.5))
+            dem = np.where(use, dsm, dem)
+            note += "; bare ground (from the orthophoto) taken from the surface model"
+            log(f"    bare ground taken from WebODM's surface model ({100 * use.mean():.0f}% of cells) "
+                "so steep bare faces aren't smoothed away")
+        change = _change_since_linz(dem, transform, dem_crs, al, kind)
+        if change is not None and detect:
+            if kind == "DSM":
+                log("    note: this is a surface model, so trees and buildings can look like change. "
+                    "For slips and earthworks, turn on DTM in WebODM.")
+            surface_change = (_change_since_linz(dsm, transform, dem_crs, al, "DTM")
+                              if dsm is not None else None)
+            det = detect_change_areas(change, transform, dem_crs, al, log, surface_change, ortho)
+            if det is not None:
+                summary = {"slips": det["slips"], **det["counts"]}
+    dsm = None
 
     if check:
-        return
+        return summary
     from pyproj import CRS
     crs_name = CRS.from_user_input(out_crs or dem_crs or ortho_crs).name
     log(f"    coordinate system: {crs_name}")
@@ -1169,46 +1265,472 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
         log(f"    wrote {os.path.basename(out)} and a transparent .png (+ .pgw/.prj) for CAD")
     grids = []
     if dem is not None:
-        grids.append((f"{name} - {kind} NZVD2016.tif", dem, note))
-    if change is not None:
-        grids.append((f"{name} - change since LINZ (m).tif", change,
-                      f"this survey's {kind} minus LINZ 1 m LiDAR "
-                      f"{'DEM' if kind == 'DTM' else 'DSM'}; negative = ground lower now"))
-    for fn, grid, gnote in grids:
-        T, crs = transform, dem_crs
+        grids.append((f"{name} - {kind} NZVD2016.tif", dem, transform, note))
+    ref_name = "DEM" if kind == "DTM" else "DSM"
+    if det is not None:
+        grids.append((f"{name} - change since LINZ (m).tif", det["resid"], det["transform"],
+                      f"this survey's {kind} minus LINZ 1 m LiDAR {ref_name}, broad warping removed, "
+                      "trees/buildings/water blank; negative = ground lower now"))
+    elif change is not None:
+        grids.append((f"{name} - change since LINZ (m).tif", change, transform,
+                      f"this survey's {kind} minus LINZ 1 m LiDAR {ref_name}; "
+                      "negative = ground lower now"))
+    for fn, grid, T, gnote in grids:
+        crs = dem_crs
         if out_crs is not None and CRS.from_user_input(out_crs) != CRS.from_user_input(crs):
             grid, T = _warp_array(grid, T, crs, out_crs)
             crs = out_crs
         _write_dem(os.path.join(out_root, fn), grid, T, crs, gnote)
         log(f"    wrote {fn}")
+    if det is not None and det["areas"]:
+        ortho_out = os.path.join(out_root, f"{name} - orthophoto.tif") if ortho else None
+        summary["preview"] = write_change_outputs(det, out_root, name, out_crs, ortho_out, log)
+    return summary
 
 
-def _change_since_linz(dem, transform, crs, al, kind, log):
+def _linz_grid(al, key, transform, shape, crs, method="bilinear"):
+    """One of the LINZ layers held by an Alignment ('dsm', 'dem', 'flat'), on a survey grid."""
+    from affine import Affine
+    a, T = al.linz[key]
+    # sample LINZ at the spot matching each survey cell (see Alignment.dx/dy)
+    return _to_grid(a, T, "EPSG:2193", Affine.translation(al.dx, al.dy) * transform, shape, crs,
+                    method)
+
+
+def _change_since_linz(dem, transform, crs, al, kind):
     """This survey minus the LINZ LiDAR it was aligned to, on the survey's grid (NaN on water)."""
-    from pyproj import Transformer
-    h, w = dem.shape
-    rows, cols = np.mgrid[0:h, 0:w]
-    x, y = transform * (cols.ravel() + 0.5, rows.ravel() + 0.5)
-    X, Y = Transformer.from_crs(crs, "EPSG:2193", always_xy=True).transform(x, y)
-    ref = _bilinear(al.linz["dem" if kind == "DTM" else "dsm"], X, Y).reshape(h, w)
-    water = (_bilinear(al.linz["flat"], X, Y) >= 0.5).reshape(h, w)
+    ref = _linz_grid(al, "dem" if kind == "DTM" else "dsm", transform, dem.shape, crs)
+    water = _linz_grid(al, "flat", transform, dem.shape, crs, "nearest") >= 0.5
     change = np.where(water, np.nan, dem - ref)
-    ok = np.isfinite(change)
-    if not ok.any():
+    return change if np.isfinite(change).any() else None
+
+
+# --------------------------------------------------------------------------
+# Change detection: cut, fill and slips since the LINZ LiDAR.
+#
+# The raw change (survey minus LiDAR) is cleaned up first: trees and buildings
+# (from LINZ's DSM - DEM, and the survey's own DSM - DTM), water and the ragged
+# map edge are masked, and broad warping of the drone model is removed by
+# subtracting a smooth background measured on the remaining stable ground.
+# Whatever still differs by more than ~3x the noise, over a big enough area,
+# is a change area: lower = cut, higher = fill, and a cut with fill directly
+# downhill of it on a slope = slip (scarp + debris).
+# --------------------------------------------------------------------------
+
+DETECT_CELL = 0.5          # m - grid the detection runs on
+BACKGROUND_WINDOW = 60.0   # m - broader warping of the drone model than this is removed
+MIN_AREA = 20.0            # m2 - smaller patches are ignored
+MIN_VOLUME = 5.0           # m3
+# class codes in the change-areas raster, and how they're drawn
+CLASSES = {1: ("CUT", (245, 160, 30)), 2: ("FILL", (40, 110, 225)),
+           3: ("SLIP scarp", (225, 30, 30)), 4: ("SLIP debris", (150, 60, 210)),
+           5: ("SLIP?", (245, 90, 140)), 6: ("CHECK", (235, 225, 60)),
+           9: ("not measurable", (128, 128, 128))}
+DXF_LAYERS = {"CUT": 30, "FILL": 5, "SLIP": 1, "SLIP?": 6, "CHECK": 2}  # layer: AutoCAD colour index
+
+
+def _block_reduce(a, k, func):
+    """Reduce a 2-D array by k x k blocks (a partial last block is padded with NaN)."""
+    import warnings
+    h, w = -(-a.shape[0] // k), -(-a.shape[1] // k)
+    p = np.full((h * k, w * k), np.nan)
+    p[:a.shape[0], :a.shape[1]] = a
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN blocks
+        return func(p.reshape(h, k, w, k), axis=(1, 3))
+
+
+def _simplify(ring, tol):
+    """Douglas-Peucker simplification of a closed ring of (x, y) points."""
+    pts = np.asarray(ring, dtype=np.float64)
+    if len(pts) < 5:
+        return pts
+    keep = np.zeros(len(pts), dtype=bool)
+    keep[[0, -1]] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        seg = pts[j] - pts[i]
+        n = np.hypot(*seg)
+        rel = pts[i + 1:j] - pts[i]
+        d = (np.abs(seg[0] * rel[:, 1] - seg[1] * rel[:, 0]) / n if n > 0
+             else np.hypot(rel[:, 0], rel[:, 1]))
+        m = int(np.argmax(d))
+        if d[m] > tol:
+            keep[i + 1 + m] = True
+            stack += [(i, i + 1 + m), (i + 1 + m, j)]
+    return pts[keep]
+
+
+def _bare_ground(ortho, T, shape, crs):
+    """Share of each grid cell that's bare ground (soil, rock, gravel, seal) in the orthophoto:
+    not green, and not dark shadow."""
+    import rasterio
+    from affine import Affine
+    from rasterio.enums import Resampling
+    with rasterio.open(ortho) as o:
+        s = max(1, int(abs(T.a) / abs(o.res[0]) / 2))  # ~2 orthophoto samples per cell
+        shp = (max(1, o.height // s), max(1, o.width // s))
+        rgb = o.read((1, 2, 3), out_shape=(3,) + shp, resampling=Resampling.average).astype(np.float64)
+        inside = (o.read(4, out_shape=shp) > 0) if o.count >= 4 else np.ones(shp, dtype=bool)
+        To = o.transform * Affine.scale(o.width / shp[1], o.height / shp[0])
+        ocrs = o.crs
+    r, g, b = rgb
+    total = np.maximum(r + g + b, 1)
+    exg = (2 * g - r - b) / total  # "excess green": grass/trees ~0.1-0.3, soil and rock ~0
+    lit = inside & (total / 3 > 60)  # ignore dark shadow, where colour means little
+    # split green from not-green with Otsu's method on this map's own colours (allows for
+    # lighting and soil colour). On mostly-green sites Otsu splits grass from trees instead,
+    # so it's only allowed to nudge the cut-off within a narrow band.
+    cut = float(np.clip(_otsu(exg[lit]), 0.02, 0.05)) if lit.sum() > 1000 else 0.04
+    bare = ((exg < cut) & lit).astype(np.float64)
+    bare[~inside] = np.nan
+    return _to_grid(bare, To, ocrs, T, shape, crs, "average")
+
+
+def _otsu(values, bins=256):
+    """Otsu's threshold: the split that best separates the values into two groups."""
+    hist, edges = np.histogram(values, bins=bins)
+    mids = (edges[:-1] + edges[1:]) / 2
+    w1 = np.cumsum(hist)
+    w2 = w1[-1] - w1
+    m1 = np.cumsum(hist * mids) / np.maximum(w1, 1)
+    m2 = (np.sum(hist * mids) - np.cumsum(hist * mids)) / np.maximum(w2, 1)
+    return mids[int(np.argmax(w1 * w2 * (m1 - m2) ** 2))]
+
+
+def detect_change_areas(change, transform, crs, al, log, surface_change=None, ortho=None):
+    """Find cut, fill and slips in `change` (survey ground minus LINZ ground; NaN = water/no data).
+
+    `surface_change` is the survey's DSM minus LINZ ground on the same grid (or None): where the
+    orthophoto shows bare ground, the DSM *is* the ground - including steep slip scarps that
+    WebODM's ground filter tends to cut out of the DTM - so it's used there instead.
+    Returns a dict with the cleaned change, class raster, polygons and per-area numbers, all on
+    a DETECT_CELL grid in `crs`.
+    """
+    import scipy.ndimage as ndi
+    from affine import Affine
+    from rasterio.features import shapes
+    from rasterio.fill import fillnodata
+
+    k = max(1, int(round(DETECT_CELL / abs(transform.a))))
+    c = _block_reduce(change, k, np.nanmean)
+    h, w = c.shape
+    T = transform * Affine.scale(k)
+    cell = abs(T.a)
+    px = cell * abs(T.e)  # m2 per cell
+
+    # what can't be measured: no data, the ragged map edge, water, trees and buildings
+    valid = np.isfinite(c)
+    edge = valid & ~ndi.binary_erosion(valid, iterations=max(1, int(round(3 / cell))))
+    ldsm = _linz_grid(al, "dsm", T, (h, w), crs)
+    ldem = _linz_grid(al, "dem", T, (h, w), crs)
+    bare = np.nan_to_num(_bare_ground(ortho, T, (h, w), crs)) > 0.5 if ortho else np.zeros((h, w), bool)
+    with np.errstate(invalid="ignore"):
+        then_high = (ldsm - ldem) > 2.5  # trees or buildings when LINZ flew
+        if surface_change is not None:
+            cs = _block_reduce(surface_change, k, np.nanmean)
+            above = cs - c  # survey DSM - DTM: trees and buildings now
+            # bare ground: use the surface model, unless it's an old building still standing
+            use_dsm = bare & np.isfinite(cs) & ~((above > 2.5) & then_high)
+            c = np.where(use_dsm, cs, c)
+            # trees: standing above the DTM now, or there when LINZ flew (WebODM's DTM often
+            # keeps the canopy of dense bush, so DSM - DTM alone misses it); bare ground is
+            # never vegetation - that's where slips and earthworks show up
+            vegetation = ((above > 1.0) | ((ldsm - ldem) > 1.0)) & ~use_dsm
+        else:
+            vegetation = ((ldsm - ldem) > 1.0) & ~bare
+    vegetation = ndi.binary_dilation(vegetation, iterations=max(1, int(round(1 / cell))))
+    valid = np.isfinite(c)
+    unreliable = ~valid | edge | vegetation
+
+    # remove broad warping: smooth background of the stable ground, on a ~5 m block grid
+    B = max(1, int(round(5.0 / cell)))
+    coarse = _block_reduce(np.where(unreliable, np.nan, c), B, np.nanmedian)
+    win = max(3, int(BACKGROUND_WINDOW / (B * cell)) | 1)
+    import warnings
+    with np.errstate(invalid="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN neighbourhoods
+        bg = ndi.generic_filter(coarse, np.nanmedian, size=win, mode="nearest", cval=np.nan)
+    if np.isfinite(bg).any():
+        fill_ok = np.isfinite(bg)
+        bg = fillnodata(np.where(fill_ok, bg, 0).astype(np.float32), mask=fill_ok.astype(np.uint8),
+                        max_search_distance=max(bg.shape)).astype(np.float64)
+    else:
+        bg = np.zeros_like(coarse)
+    bg = _to_grid(bg, T * Affine.scale(B), crs, T, (h, w), crs)
+    resid = c - np.nan_to_num(bg)
+
+    stable = ~unreliable
+    if stable.sum() < 100:
+        log("    change areas: not enough open ground to measure change - skipped")
         return None
-    cell = abs(transform.a * transform.e)
-    down, up = ok & (change < -0.5), ok & (change > 0.5)
-    log(f"    change since LINZ LiDAR ({ok.sum() * cell:,.0f} m2 compared): "
-        f"{down.sum() * cell:,.0f} m2 lower by > 0.5 m ({change[down].sum() * cell:,.0f} m3), "
-        f"{up.sum() * cell:,.0f} m2 higher by > 0.5 m (+{change[up].sum() * cell:,.0f} m3)")
-    if kind == "DSM":
-        log("    note: this is a surface model, so trees and buildings count as change too. "
-            "For slips, turn on DTM in WebODM.")
-    return change
+    sigma = 1.4826 * float(np.median(np.abs(resid[stable])))
+    thr = max(0.5, 3 * sigma)       # a change area must reach this somewhere ...
+    low = max(0.25, 1.5 * sigma)    # ... and extends over connected ground that moved this much
+
+    # slope and downhill direction from the LINZ ground model
+    g_row, g_col = np.gradient(ldem, cell)
+    dzde, dzdn = np.nan_to_num(g_col), np.nan_to_num(-g_row)
+    slope = np.degrees(np.arctan(np.hypot(dzde, dzdn)))
+
+    eight = np.ones((3, 3), dtype=bool)
+    found = []
+    for sign, kind_ in ((-1, "cut"), (1, "fill")):
+        # hysteresis: grow each clearly-changed core out over connected ground that moved
+        # at least `low`, so the outline follows the whole area, not just its deepest part
+        strong = stable & (sign * resid > thr)
+        weak = stable & (sign * resid > low)
+        weak = ndi.binary_closing(ndi.binary_opening(weak, eight), eight) & stable
+        lab, n = ndi.label(weak, structure=eight)
+        cores = np.unique(lab[strong & (lab > 0)])
+        if len(cores) == 0:
+            continue
+        mask = np.isin(lab, cores)
+        mask = ndi.binary_fill_holes(mask) & stable
+        lab, n = ndi.label(mask, structure=eight)
+        idx = np.arange(1, n + 1)
+        count = ndi.sum(np.ones_like(resid), lab, idx)
+        vol = ndi.sum(np.nan_to_num(resid), lab, idx) * px
+        ext = (ndi.minimum if sign < 0 else ndi.maximum)(np.nan_to_num(resid), lab, idx)
+        com = ndi.center_of_mass(mask, lab, idx)
+        sl = ndi.mean(slope, lab, idx)
+        de, dn = ndi.mean(dzde, lab, idx), ndi.mean(dzdn, lab, idx)
+        bf = ndi.mean(bare.astype(np.float64), lab, idx)
+        for i in range(n):
+            area = count[i] * px
+            if area < MIN_AREA or abs(vol[i]) < MIN_VOLUME:
+                continue
+            r, cc = com[i]
+            x, y = T * (cc + 0.5, r + 0.5)
+            found.append({"label": (kind_, i + 1), "lab": lab, "kind": kind_, "area": area,
+                          "volume": float(vol[i]), "extreme": float(ext[i]), "slope": float(sl[i]),
+                          "bare": float(bf[i]), "down": -np.array([de[i], dn[i]]),
+                          "xy": np.array([x, y])})
+
+    # slips: a cut on a slope with fill directly downhill of it
+    cuts = [f for f in found if f["kind"] == "cut"]
+    fills = [f for f in found if f["kind"] == "fill"]
+    for f in found:
+        f["type"], f["part"], f["group"] = ("CUT" if f["kind"] == "cut" else "FILL"), "", None
+    group = 0
+    for cut in sorted(cuts, key=lambda f: f["volume"]):
+        d = cut["down"]
+        if cut["slope"] < 10 or not np.hypot(*d):
+            continue
+        d = d / np.hypot(*d)
+        reach = 10 + 1.5 * np.sqrt(cut["area"])
+        debris = [f for f in fills if f["group"] is None and 0 < np.hypot(*(f["xy"] - cut["xy"])) <= reach
+                  and np.dot(f["xy"] - cut["xy"], d) / np.hypot(*(f["xy"] - cut["xy"])) >= 0.5]
+        if debris:
+            group += 1
+            for f in [cut] + debris:
+                f["type"], f["group"] = "SLIP", group
+                f["part"] = "scarp" if f is cut else "debris"
+    for cut in sorted(cuts, key=lambda f: f["volume"]):
+        if cut["type"] != "CUT":
+            continue
+        if cut["slope"] >= 15 and cut["bare"] >= 0.3:
+            # fresh bare ground lowered on a slope: a slip scar (any debris has gone or is
+            # under vegetation)
+            group += 1
+            cut["type"], cut["part"], cut["group"] = "SLIP", "scarp", group
+        elif cut["slope"] >= 25:
+            cut["type"], cut["part"] = "SLIP?", "scarp only"
+
+    # final numbering (biggest first), class raster, polygons, notes
+    found.sort(key=lambda f: -abs(f["volume"]))
+    classes = np.where(unreliable, 9, 0).astype(np.uint8)
+    ids = np.zeros((h, w), dtype=np.int32)
+    ring_px = max(1, int(round(2 / cell)))
+    for n_, f in enumerate(found, 1):
+        f["id"] = n_
+        lab, num = f.pop("lab"), f["label"][1]
+        sl_ = ndi.find_objects((lab == num).astype(np.int8))[0]
+        pad = tuple(slice(max(s.start - ring_px - 1, 0), s.stop + ring_px + 1) for s in sl_)
+        region = lab[pad] == num
+        ids[pad][region] = n_
+        ring = ndi.binary_dilation(region, iterations=ring_px) & ~region
+        near = (unreliable[pad] & ring).sum() / max(1, ring.sum())
+        f["note"] = "next to trees, water or the map edge - check" if near > 0.4 else ""
+        if f["type"] == "FILL" and near > 0.4:
+            # raised ground hemmed in by bush is usually canopy WebODM's DTM didn't remove
+            f["type"] = "CHECK"
+        code = ({"CUT": 1, "FILL": 2, "SLIP?": 5, "CHECK": 6}.get(f["type"])
+                or (3 if f["part"] == "scarp" else 4))
+        classes[pad][region] = code
+    polys = {}
+    for geom, v in shapes(ids, mask=ids > 0, transform=T, connectivity=8):
+        polys.setdefault(int(v), []).extend(
+            _simplify(ring, cell * 0.75) for ring in geom["coordinates"])
+    for f in found:
+        f["polygons"] = polys.get(f["id"], [])
+
+    n_slip = len({f["group"] for f in found if f["type"] == "SLIP"})
+    counts = {t: sum(f["type"] == t for f in found) for t in ("CUT", "FILL", "SLIP?", "CHECK")}
+    measured = stable.sum() * px
+    log(f"    change areas: noise +/-{sigma:.2f} m, so change over {thr:.2f} m counts; "
+        f"{measured:,.0f} m2 of open ground measured ({100 * stable.mean():.0f}% of the map)")
+    log(f"    found {n_slip} slip(s), {counts['SLIP?']} possible slip scarp(s), "
+        f"{counts['CUT']} cut and {counts['FILL']} fill area(s), plus {counts['CHECK']} raised "
+        "area(s) next to bush to check (usually leftover canopy)")
+    for f in found[:15]:
+        name = f["type"] + (f" {f['group']} {f['part']}" if f["group"] else "")
+        log(f"      #{f['id']} {name}: {f['area']:,.0f} m2, {abs(f['volume']):,.0f} m3 "
+            f"{'removed' if f['volume'] < 0 else 'added'}, up to {abs(f['extreme']):.1f} m "
+            f"{'deep' if f['volume'] < 0 else 'high'}, slope {f['slope']:.0f} deg"
+            + (f" ({f['note']})" if f["note"] else ""))
+    return {"resid": np.where(unreliable, np.nan, resid), "classes": classes, "transform": T,
+            "crs": crs, "areas": found, "threshold": thr, "sigma": sigma, "slips": n_slip,
+            "counts": counts}
+
+
+def write_change_outputs(det, out_root, name, out_crs, ortho_tif, log):
+    """DXF outlines + labels, CSV table, GeoJSON, a transparent overlay (GeoTIFF + PNG for CAD)
+    and a quick-look preview over the orthophoto."""
+    import csv
+    import json
+    import rasterio
+    from pyproj import CRS, Transformer
+    T, crs, classes = det["transform"], det["crs"], det["classes"]
+    to_out = None
+    if out_crs is not None and CRS.from_user_input(out_crs) != CRS.from_user_input(crs):
+        to_out = Transformer.from_crs(crs, out_crs, always_xy=True)
+    dst_crs = out_crs or crs
+
+    def xy(pts):
+        pts = np.asarray(pts, dtype=np.float64)
+        if to_out is None:
+            return pts
+        x, y = to_out.transform(pts[:, 0], pts[:, 1])
+        return np.c_[x, y]
+
+    areas = det["areas"]
+    for f in areas:
+        f["label_name"] = f["type"] + (f" {f['group']} {f['part']}" if f["group"] else "")
+        f["xy_out"] = xy(f["xy"][None])[0]
+
+    # DXF for BricsCAD / AutoCAD
+    import ezdxf
+    doc = ezdxf.new("R2010", setup=True)
+    doc.header["$INSUNITS"] = 6  # metres
+    msp = doc.modelspace()
+    for layer, colour in DXF_LAYERS.items():
+        doc.layers.add(f"CHANGE_{layer.replace('?', '_POSSIBLE')}", color=colour)
+    doc.layers.add("CHANGE_LABELS", color=7)
+    for f in areas:
+        layer = f"CHANGE_{f['type'].replace('?', '_POSSIBLE')}"
+        for ring in f["polygons"]:
+            msp.add_lwpolyline([tuple(p) for p in xy(ring)], close=True, dxfattribs={"layer": layer})
+        sign = "-" if f["volume"] < 0 else "+"
+        text = (f"#{f['id']} {f['label_name']}\\P{f['area']:,.0f} m²  {sign}{abs(f['volume']):,.0f} m³"
+                f"\\P{'max depth' if f['volume'] < 0 else 'max height'} {abs(f['extreme']):.1f} m")
+        msp.add_mtext(text, dxfattribs={"layer": "CHANGE_LABELS", "char_height": 1.0,
+                                        "insert": tuple(f["xy_out"]),
+                                        "attachment_point": 5})
+    dxf_path = os.path.join(out_root, f"{name} - change areas.dxf")
+    doc.saveas(dxf_path)
+
+    # table
+    with open(os.path.join(out_root, f"{name} - change areas.csv"), "w", newline="") as fh:
+        wr = csv.writer(fh)
+        wr.writerow(["id", "type", "slip", "part", "area_m2", "cut_m3", "fill_m3", "net_m3",
+                     "max_depth_or_height_m", "slope_deg", "easting", "northing", "note"])
+        for f in areas:
+            v = f["volume"]
+            wr.writerow([f["id"], f["type"], f["group"] or "", f["part"], round(f["area"], 1),
+                         round(max(-v, 0), 1), round(max(v, 0), 1), round(v, 1),
+                         round(abs(f["extreme"]), 2), round(f["slope"], 1),
+                         round(float(f["xy_out"][0]), 2), round(float(f["xy_out"][1]), 2), f["note"]])
+
+    # GeoJSON for GIS (in the export coordinate system)
+    feats = [{"type": "Feature",
+              "properties": {"id": f["id"], "type": f["type"], "slip": f["group"], "part": f["part"],
+                             "area_m2": round(f["area"], 1), "net_m3": round(f["volume"], 1),
+                             "note": f["note"]},
+              "geometry": {"type": "Polygon", "coordinates": [xy(r).tolist() for r in f["polygons"]]}}
+             for f in areas if f["polygons"]]
+    epsg = CRS.from_user_input(dst_crs).to_epsg()
+    with open(os.path.join(out_root, f"{name} - change areas.geojson"), "w") as fh:
+        json.dump({"type": "FeatureCollection", "features": feats,
+                   **({"crs": {"type": "name", "properties": {"name": f"EPSG:{epsg}"}}} if epsg else {})},
+                  fh)
+
+    # transparent coloured overlay, in the export coordinate system
+    rgba_cls = np.zeros((4,) + classes.shape, dtype=np.uint8)
+    for code, (_, rgb) in CLASSES.items():
+        m = classes == code
+        for b in range(3):
+            rgba_cls[b][m] = rgb[b]
+        rgba_cls[3][m] = 70 if code == 9 else 200
+    T2, cls2 = T, classes
+    if to_out is not None:
+        from rasterio.enums import Resampling
+        from rasterio.warp import calculate_default_transform, reproject
+        from rasterio.transform import array_bounds
+        hh, ww = classes.shape
+        T2, w2, h2 = calculate_default_transform(crs, dst_crs, ww, hh,
+                                                 *array_bounds(hh, ww, T), resolution=abs(T.a))
+        cls2 = np.zeros((h2, w2), dtype=np.uint8)
+        reproject(classes, cls2, src_transform=T, src_crs=crs, dst_transform=T2, dst_crs=dst_crs,
+                  src_nodata=0, dst_nodata=0, resampling=Resampling.nearest)
+        rgba_cls = np.zeros((4, h2, w2), dtype=np.uint8)
+        for code, (_, rgb) in CLASSES.items():
+            m = cls2 == code
+            for b in range(3):
+                rgba_cls[b][m] = rgb[b]
+            rgba_cls[3][m] = 70 if code == 9 else 200
+    overlay = os.path.join(out_root, f"{name} - change areas.tif")
+    with rasterio.open(overlay, "w", driver="GTiff", width=rgba_cls.shape[2],
+                       height=rgba_cls.shape[1], count=4, dtype="uint8", crs=dst_crs, transform=T2,
+                       photometric="RGB", alpha="PREMULTIPLIED", compress="deflate") as dst:
+        premult = rgba_cls.copy()
+        for b in range(3):  # associated alpha: colour scaled by opacity
+            premult[b] = (rgba_cls[b].astype(np.uint16) * rgba_cls[3] // 255).astype(np.uint8)
+        dst.write(premult)
+    _write_png_copy(overlay, overlay[:-4] + ".png")
+
+    # quick-look preview: change areas drawn over the orthophoto
+    preview = None
+    if ortho_tif and os.path.exists(ortho_tif):
+        from rasterio.enums import Resampling
+        from rasterio.warp import reproject
+        from affine import Affine
+        with rasterio.open(ortho_tif) as o:
+            s = max(1, int(np.ceil(max(o.width, o.height) / 1800)))
+            shp = (max(1, o.height // s), max(1, o.width // s))
+            img = o.read((1, 2, 3), out_shape=(3,) + shp, resampling=Resampling.average).astype(np.float64)
+            alpha = o.read(4, out_shape=shp) if o.count >= 4 else np.full(shp, 255)
+            Tp = o.transform * Affine.scale(o.width / shp[1], o.height / shp[0])
+            pcrs = o.crs
+        cls_p = np.zeros(shp, dtype=np.uint8)
+        reproject(classes, cls_p, src_transform=T, src_crs=crs, dst_transform=Tp, dst_crs=pcrs,
+                  src_nodata=0, dst_nodata=0, resampling=Resampling.nearest)
+        import scipy.ndimage as ndi
+        img[:, alpha == 0] = 255  # white outside the map
+        for code, (_, rgb) in CLASSES.items():
+            m = cls_p == code
+            a = 0.25 if code == 9 else 0.45
+            for b in range(3):
+                img[b][m] = img[b][m] * (1 - a) + rgb[b] * a
+            if code != 9:  # solid outline so small areas stand out
+                edge = ndi.binary_dilation(m, iterations=2) & ~ndi.binary_erosion(m, iterations=1)
+                for b in range(3):
+                    img[b][edge] = rgb[b]
+        preview = os.path.join(out_root, f"{name} - change areas preview.png")
+        with rasterio.Env(GDAL_PAM_ENABLED="NO"):
+            with rasterio.open(preview, "w", driver="PNG", width=shp[1], height=shp[0], count=3,
+                               dtype="uint8") as dst:
+                dst.write(np.clip(img, 0, 255).astype(np.uint8))
+    log(f"    wrote change areas: .dxf (outlines + labels for CAD), .csv (volumes), .geojson, "
+        f"coloured overlay (.tif + transparent .png)" + (" and a preview" if preview else ""))
+    return preview
 
 
 def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
-                    name="map", full=False, out_crs=None):
+                    name="map", full=False, out_crs=None, cell=0.25, detect=True):
     """Returns {"offset": metres, "spread": metres} for automatic mode, else {}.
 
     Always exports the orthophoto and a corrected elevation model as GeoTIFFs; with
@@ -1255,7 +1777,8 @@ def process_outputs(files, in_root, out_root, mode, offset, geoid, check, log,
         for path in rasters:
             with rasterio.open(path) as ds:
                 task_crs = task_crs or ds.crs
-    export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log, out_crs)
+    result.update(export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log,
+                              out_crs, cell, detect) or {})
     if not full:
         if not check:
             log("Done.")
@@ -1299,7 +1822,7 @@ def _export_name(input_path):
 
 
 def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=False,
-        grid=None, log=print, full=False, out_crs=None):
+        grid=None, log=print, full=False, out_crs=None, cell=0.25, detect=True):
     if mode not in ("auto", "geoid", "offset", "takeoff"):
         raise FixError(f"unknown mode {mode}")
     if mode == "takeoff" and takeoff is None:
@@ -1353,7 +1876,8 @@ def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=Fa
                 raise FixError("takeoff mode is for raw photos; use geoid or offset for WebODM outputs")
             log(f"Input looks like WebODM outputs. Mode: {mode}")
             return process_outputs(files, in_root, output_dir, mode, offset, geoid, check, log,
-                                   name=_export_name(input_path), full=full, out_crs=out_crs)
+                                   name=_export_name(input_path), full=full, out_crs=out_crs,
+                                   cell=cell, detect=detect)
         else:
             photos = sorted(f for f in files if f.lower().endswith(PHOTO_EXTS))
             if not photos:
@@ -1488,6 +2012,15 @@ def _describe_result(result, check, out_dir):
     else:
         msg = (f"Done! Heights were {'raised' if off > 0 else 'lowered'} by {abs(off):.2f} m.\n"
                f"Corrected files are in: {out_dir}")
+    if "slips" in result:
+        found = [f"{result['slips']} slip(s)" if result["slips"] else "",
+                 f"{result['CUT']} cut" if result["CUT"] else "",
+                 f"{result['FILL']} fill" if result["FILL"] else "",
+                 f"{result['SLIP?']} possible slip scarp(s)" if result["SLIP?"] else ""]
+        found = ", ".join(x for x in found if x)
+        msg += (f"\nChange since the LINZ LiDAR: {found or 'nothing significant found'}"
+                + (f" (+{result['CHECK']} to check next to bush)" if result.get("CHECK") else "")
+                + (" - see the change areas preview." if result.get("preview") else "."))
     if result.get("tilt", 0) > 1.0:
         msg += (f"\nNote: the model was tilted by about {result['tilt']:.1f} m across the site "
                 "(corrected). Ground control points would make it more reliable.")
@@ -1512,7 +2045,7 @@ def gui():
 
     root = tk.Tk()
     root.title(f"{APP_NAME} {__version__}")
-    root.geometry("840x800")
+    root.geometry("900x860")
     root.minsize(680, 560)
     try:
         root.iconbitmap(_resource("icon.ico"))
@@ -1537,6 +2070,10 @@ def gui():
     offset, takeoff = tk.StringVar(value="0"), tk.StringVar()
     advanced = tk.BooleanVar(value=False)
     full = tk.BooleanVar(value=False)
+    detect = tk.BooleanVar(value=True)
+    cell_choices = [(0.1, "0.1 m"), (0.25, "0.25 m (recommended)"), (0.5, "0.5 m"), (1.0, "1 m"),
+                    (None, "Same as WebODM")]
+    preview = {"path": None}
     from pyproj import CRS
     crs_choices = [(code, f"{name or CRS.from_user_input(code).name}  ({code})")
                    for code, name in EXPORT_CRS] + [(None, "Same as WebODM (UTM)")]
@@ -1603,8 +2140,16 @@ def gui():
                              width=58)
     crs_combo.current(next(i for i, (code, _) in enumerate(crs_choices) if code == DEFAULT_CRS))
     crs_combo.pack(side="left", padx=(6, 0))
+    ttk.Label(cf, text="Elevation cell size:").pack(side="left", padx=(16, 0))
+    cell_combo = ttk.Combobox(cf, values=[label for _, label in cell_choices], state="readonly",
+                              width=16)
+    cell_combo.current(1)
+    cell_combo.pack(side="left", padx=(6, 0))
+    ttk.Checkbutton(s2, text="Find cut, fill and slips since the LINZ LiDAR (outlines + volumes "
+                             "as DXF/CSV)", variable=detect).grid(
+        row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
     ttk.Checkbutton(s2, text="Also export the point cloud and 3D model (.laz, .obj)",
-                    variable=full).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
+                    variable=full).grid(row=6, column=0, columnspan=2, sticky="w")
 
     def suggest_output(*_):
         src = inp.get().strip().strip('"')
@@ -1643,6 +2188,10 @@ def gui():
     b_open = ttk.Button(res, text="Open output folder", command=lambda: os.startfile(outp.get()))
     b_open.grid(row=0, column=1, sticky="ne", padx=(8, 0))
     b_open.grid_remove()
+    b_prev = ttk.Button(res, text="Open change preview",
+                        command=lambda: preview["path"] and os.startfile(preview["path"]))
+    b_prev.grid(row=1, column=1, sticky="ne", padx=(8, 0), pady=(4, 0))
+    b_prev.grid_remove()
 
     # advanced options (hidden unless asked for)
     adv = ttk.Frame(frm)
@@ -1712,6 +2261,7 @@ def gui():
         for b in buttons:
             b.state(["disabled"])
         b_open.grid_remove()
+        b_prev.grid_remove()
         progress.grid()
         progress.start(12)
         status.set("Checking... (this usually takes under a minute)" if check else
@@ -1719,12 +2269,14 @@ def gui():
         status_lbl.configure(style="Status.TLabel")
         logbox.delete("1.0", "end")
         out_crs = crs_choices[crs_combo.current()][0]
+        cell = cell_choices[cell_combo.current()][0]
+        find = detect.get()
 
         def work():
             try:
                 result = run(src, dst, mode.get(), off, tko, check,
                              log=lambda m: q.put(("log", m)), full=full.get(),
-                             out_crs=out_crs)
+                             out_crs=out_crs, cell=cell, detect=find)
                 q.put(("done", (check, result or {}, dst)))
             except Exception as e:
                 q.put(("err", str(e) or e.__class__.__name__))
@@ -1819,6 +2371,9 @@ def gui():
                     status_lbl.configure(style="Warn.Status.TLabel" if warn else "Good.Status.TLabel")
                     if not check and os.path.isdir(dst):
                         b_open.grid()
+                    preview["path"] = result.get("preview")
+                    if preview["path"] and os.path.exists(preview["path"]):
+                        b_prev.grid()
                 else:
                     finish()
                     status.set(f"Something went wrong: {msg}")
@@ -1869,13 +2424,19 @@ def main():
                     help="coordinate system for the exported GeoTIFFs/PNG, e.g. EPSG:2193 for "
                          "NZTM 2000, or 'webodm' to keep WebODM's UTM (default EPSG:2105, "
                          "Mount Eden 2000)")
+    ap.add_argument("--cell", default="0.25",
+                    help="elevation model cell size in metres, or 'webodm' to keep WebODM's "
+                         "(default 0.25)")
+    ap.add_argument("--no-detect", action="store_true",
+                    help="don't look for cut, fill and slips since the LINZ LiDAR")
     ap.add_argument("--full", action="store_true",
                     help="also correct the point cloud, 3D model and WebODM's own DEMs")
     ap.add_argument("--grid", help=f"path to {GEOID_FILENAME} (downloaded automatically if omitted)")
     a = ap.parse_args()
     try:
         run(a.input, a.output, a.mode, a.offset, a.takeoff_elev, a.check, a.grid,
-            full=a.full, out_crs=None if a.crs.lower() == "webodm" else a.crs)
+            full=a.full, out_crs=None if a.crs.lower() == "webodm" else a.crs,
+            cell=None if a.cell.lower() == "webodm" else float(a.cell), detect=not a.no_detect)
     except FixError as e:
         sys.exit(f"ERROR: {e}")
 
