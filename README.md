@@ -28,6 +28,16 @@ It also makes a **change map** showing your survey minus the LiDAR, so you can s
 
 WebODM Height Fix NZ then appears in your Start menu. To remove it, go to *Settings > Apps > Installed apps*.
 
+### Updates
+
+The app checks GitHub for a newer version each time it starts. When there is one, a blue bar appears at the top of the window. Click **Update now** and it does the rest:
+
+1. It downloads the new installer.
+2. It checks the download against the release's published checksum.
+3. It installs it and reopens the app.
+
+You can click **Not now** to skip it until next time. If you're offline, it just doesn't check.
+
 ## How to use it
 
 1. In WebODM, open your finished task and click **Download Assets > All Assets**. This gives you `all.zip`.
@@ -120,7 +130,9 @@ This writes the app to `dist\WebODMHeightFixNZ\` and, if [Inno Setup 6](https://
 **Release a new version:**
 1. Bump `__version__` in `nz_height_fix.py` and commit.
 2. Push a matching tag, e.g. `git tag v1.0.1` then `git push origin v1.0.1`.
-3. GitHub Actions builds the installer and publishes it on the Releases page.
+3. GitHub Actions builds the installer and publishes it on the Releases page with `SHA256SUMS.txt`. Installed copies then offer the update. The updater ignores releases without that checksum file.
+
+To test the updater without publishing, set `WEBODM_HEIGHT_FIX_UPDATE_URL` to a JSON file shaped like GitHub's *latest release* response, served locally.
 
 Every push to `main` also builds the installer. You can download it from the workflow run's *Artifacts*.
 

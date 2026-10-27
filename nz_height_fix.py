@@ -1366,6 +1366,113 @@ def run(input_path, output_dir, mode="geoid", offset=0.0, takeoff=None, check=Fa
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------
+# Auto-update from GitHub Releases
+# --------------------------------------------------------------------------
+
+UPDATE_API = "https://api.github.com/repos/nicholasjg503/WebODM-Height-Fix-NZ/releases/latest"
+INSTALLER_PREFIX = "WebODM-Height-Fix-NZ-Setup-"
+
+
+def _version_tuple(v):
+    return tuple(int(n) for n in re.findall(r"\d+", v)[:3])
+
+
+def _http(url, timeout):
+    """urlopen with a User-Agent (GitHub requires one) and certifi's CA bundle when available."""
+    import ssl
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ctx = ssl.create_default_context()
+    req = urllib.request.Request(url, headers={"User-Agent": f"WebODMHeightFixNZ/{__version__}",
+                                               "Accept": "application/vnd.github+json"})
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+
+def check_for_update(timeout=10):
+    """The latest GitHub release if it's newer than this copy, else None.
+
+    Returns {"version", "notes_url", "installer": (file name, url), "sums_url"}. Releases without
+    an installer and a SHA256SUMS.txt are ignored. WEBODM_HEIGHT_FIX_UPDATE_URL overrides the
+    release API URL (for testing).
+    """
+    import json
+    with _http(os.environ.get("WEBODM_HEIGHT_FIX_UPDATE_URL", UPDATE_API), timeout) as r:
+        rel = json.load(r)
+    if rel.get("draft") or rel.get("prerelease"):
+        return None
+    version = str(rel.get("tag_name", "")).lstrip("vV")
+    if not version or _version_tuple(version) <= _version_tuple(__version__):
+        return None
+    assets = {a.get("name", ""): a.get("browser_download_url") for a in rel.get("assets", [])}
+    installer = next((n for n in assets if n.startswith(INSTALLER_PREFIX) and n.endswith(".exe")), None)
+    if installer is None or "SHA256SUMS.txt" not in assets:
+        return None
+    return {"version": version, "notes_url": rel.get("html_url"),
+            "installer": (installer, assets[installer]), "sums_url": assets["SHA256SUMS.txt"]}
+
+
+def download_update(info, progress=lambda done, total: None):
+    """Download the release installer and check it against the release's SHA256SUMS.txt.
+
+    Returns the installer's path. Raises FixError if the checksum is missing or wrong.
+    """
+    import hashlib
+    name, url = info["installer"]
+    with _http(info["sums_url"], 30) as r:
+        sums = r.read().decode("utf-8", "replace")
+    expected = None
+    for ln in sums.splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == name:
+            expected = parts[0].lower()
+    if not expected:
+        raise FixError("The update has no checksum, so it wasn't installed.")
+    folder = os.path.join(tempfile.gettempdir(), "WebODMHeightFixNZ-update")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
+    h = hashlib.sha256()
+    with _http(url, 60) as r, open(path + ".part", "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            progress(done, total)
+    if h.hexdigest().lower() != expected:
+        os.remove(path + ".part")
+        raise FixError("The downloaded update didn't match its checksum, so it wasn't installed.")
+    os.replace(path + ".part", path)
+    return path
+
+
+def launch_installer(path):
+    """Start the installer with a progress window only; it reopens the app when finished."""
+    import subprocess
+    local = os.path.normcase(os.environ.get("LOCALAPPDATA", ""))
+    per_user = bool(local) and os.path.normcase(_app_dir()).startswith(local)
+    subprocess.Popen([path, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS",
+                      "/RELAUNCH=1", "/CURRENTUSER" if per_user else "/ALLUSERS"], close_fds=True)
+
+
+def _update_from_command_line():
+    """--update: check, download, verify and start the installer without the window."""
+    info = check_for_update()
+    if info is None:
+        print(f"{APP_NAME} {__version__} is up to date.")
+        return 0
+    print(f"Downloading {APP_NAME} {info['version']} ...")
+    launch_installer(download_update(info))
+    print("Installing - the app will reopen when it's done.")
+    return 0
+
+
 def _describe_result(result, check, out_dir):
     """Plain-English summary of a run, and whether it deserves a warning."""
     if "offset" not in result:
@@ -1629,11 +1736,79 @@ def gui():
         for b in buttons:
             b.state(["!disabled"])
 
+    # update bar: shown above everything when GitHub has a newer release
+    style.configure("Update.TFrame", background="#e3effb")
+    style.configure("Update.TLabel", background="#e3effb", font=("Segoe UI", 10))
+    bar = ttk.Frame(root, style="Update.TFrame", padding=(18, 8))
+    bar_text = tk.StringVar()
+    ttk.Label(bar, textvariable=bar_text, style="Update.TLabel").pack(side="left")
+    b_later = ttk.Button(bar, text="Not now", command=bar.pack_forget)
+    b_notes = ttk.Button(bar, text="What's new")
+    b_update = ttk.Button(bar, text="Update now", command=lambda: start_update())
+    for b in (b_later, b_notes, b_update):
+        b.pack(side="right", padx=(6, 0))
+    update = {}
+
+    def check_updates():
+        try:
+            info = check_for_update()
+        except Exception:
+            return  # offline or GitHub unreachable - it'll check again next time
+        if info:
+            q.put(("upd-found", info))
+
+    def start_update():
+        if any(b.instate(["disabled"]) for b in buttons):
+            messagebox.showinfo(APP_NAME, "Wait for the current job to finish, then click "
+                                          "\"Update now\".")
+            return
+        for b in [b_update, b_later, b_notes] + buttons:
+            b.state(["disabled"])
+        bar_text.set("Downloading the update...")
+
+        def work():
+            try:
+                path = download_update(update["info"],
+                                       lambda d, t: q.put(("upd-progress", (d, t))))
+                q.put(("upd-ready", path))
+            except Exception as e:
+                q.put(("upd-err", str(e) or e.__class__.__name__))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update(kind, msg):
+        if kind == "upd-found":
+            update["info"] = msg
+            bar_text.set(f"A new version ({msg['version']}) is available - you have {__version__}.")
+            b_notes.configure(command=lambda: webbrowser.open(msg["notes_url"] or HELP_URL))
+            bar.pack(before=frm, fill="x")
+        elif kind == "upd-progress":
+            done, total = msg
+            if total:
+                bar_text.set(f"Downloading the update... {100 * done // total}%")
+        elif kind == "upd-ready":
+            bar_text.set("Installing the update - the app will close and reopen in a moment.")
+            try:
+                launch_installer(msg)
+            except Exception as e:
+                on_update("upd-err", str(e))
+                return
+            root.after(1000, root.destroy)
+        elif kind == "upd-err":
+            bar_text.set(f"The update didn't work: {msg}")
+            for b in [b_update, b_later, b_notes] + buttons:
+                b.state(["!disabled"])
+
+    # only the installed app updates itself (or a test run pointed at a test server)
+    if getattr(sys, "frozen", False) or os.environ.get("WEBODM_HEIGHT_FIX_UPDATE_URL"):
+        root.after(1500, lambda: threading.Thread(target=check_updates, daemon=True).start())
+
     def poll():
         try:
             while True:
                 kind, msg = q.get_nowait()
-                if kind == "log":
+                if kind.startswith("upd-"):
+                    on_update(kind, msg)
+                elif kind == "log":
                     logbox.insert("end", msg + "\n")
                     logbox.see("end")
                 elif kind == "done":
@@ -1677,6 +1852,11 @@ def main():
         return
     if sys.argv[1] == "--selftest":
         _selftest()
+    if sys.argv[1] == "--update":
+        try:
+            sys.exit(_update_from_command_line())
+        except Exception as e:
+            sys.exit(f"Update failed: {e}")
     ap = argparse.ArgumentParser(description="Convert drone photos or WebODM outputs to NZVD2016 heights.")
     ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     ap.add_argument("input", help="photo folder, WebODM output folder, or WebODM all.zip")

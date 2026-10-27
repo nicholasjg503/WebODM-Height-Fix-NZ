@@ -37,7 +37,11 @@ $iscc = @(
 if ($iscc) {
     & $iscc /Q "/DAppVersion=$version" packaging\installer.iss
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
-    Write-Host "Installer: dist\WebODM-Height-Fix-NZ-Setup-$version.exe"
+    $setup = "WebODM-Height-Fix-NZ-Setup-$version.exe"
+    # the app's updater only installs a download whose hash matches this file
+    $hash = (Get-FileHash "dist\$setup" -Algorithm SHA256).Hash.ToLower()
+    [IO.File]::WriteAllText("$root\dist\SHA256SUMS.txt", "$hash  $setup`n")
+    Write-Host "Installer: dist\$setup (+ dist\SHA256SUMS.txt)"
 } else {
     Write-Host 'Inno Setup 6 not found - skipped the installer. The app is in dist\WebODMHeightFixNZ\.'
 }

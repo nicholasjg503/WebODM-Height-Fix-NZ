@@ -55,3 +55,11 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; the app's own updater runs this installer silently with /RELAUNCH=1: reopen the app after
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: RelaunchAfterUpdate
+
+[Code]
+function RelaunchAfterUpdate: Boolean;
+begin
+  Result := WizardSilent and (ExpandConstant('{param:RELAUNCH|0}') = '1');
+end;
