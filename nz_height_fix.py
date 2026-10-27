@@ -1173,7 +1173,7 @@ def _warp_array(a, transform, crs, dst_crs):
     return out, T2
 
 
-def _write_dem(out, dem, transform, crs, note):
+def _write_dem(out, dem, transform, crs, note, accuracy=""):
     import rasterio
     from rasterio.enums import Resampling
     h, w = dem.shape
@@ -1183,7 +1183,8 @@ def _write_dem(out, dem, transform, crs, note):
                        crs=crs, transform=transform, nodata=nodata, tiled=True, blockxsize=512,
                        blockysize=512, compress="deflate", predictor=3, BIGTIFF="IF_SAFER") as dst:
         dst.write(np.where(np.isfinite(dem), dem, nodata).astype(np.float32), 1)
-        dst.update_tags(VERTICAL_DATUM="NZVD2016", NOTE=note)
+        dst.update_tags(VERTICAL_DATUM="NZVD2016", NOTE=note,
+                        **({"ACCURACY": accuracy} if accuracy else {}))
         factors = _overview_factors(w, h)
         if factors:
             dst.build_overviews(factors, Resampling.average)
@@ -1312,6 +1313,22 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
                 summary = {"slips": det["slips"], **det["counts"]}
     dsm = None
 
+    # accuracy estimate, from how well open ground matched LINZ after the fit
+    accuracy = []
+    if al is not None:
+        fit95 = 2 * 1.4826 * al.spread  # 95% range of the open-ground misfit
+        accuracy.append(f"Heights: about +/-{max(fit95, 0.1):.1f} m (95%) compared with LINZ LiDAR "
+                        "(the LiDAR itself is about +/-0.2 m)")
+        if det is not None:
+            accuracy.append(f"Change smaller than about +/-{max(0.5, 3 * det['sigma']):.1f} m is "
+                            "within the noise - don't read it as real")
+        if al.tilt > 1.0:
+            accuracy.append(f"The drone model was tilted {al.tilt:.1f} m (corrected); ground control "
+                            "points would make it more reliable")
+        summary["accuracy"] = max(fit95, 0.1)
+        if det is not None:
+            det["accuracy"] = accuracy
+
     if check:
         return summary
     from pyproj import CRS
@@ -1339,8 +1356,18 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
         if out_crs is not None and CRS.from_user_input(out_crs) != CRS.from_user_input(crs):
             grid, T = _warp_array(grid, T, crs, out_crs)
             crs = out_crs
-        _write_dem(os.path.join(out_root, fn), grid, T, crs, gnote)
+        _write_dem(os.path.join(out_root, fn), grid, T, crs, gnote, "; ".join(accuracy))
         log(f"    wrote {fn}")
+    if accuracy:
+        with open(os.path.join(out_root, f"{name} - accuracy.txt"), "w", encoding="utf-8") as fh:
+            fh.write(f"{APP_NAME} {__version__} - accuracy of these files\n\n"
+                     + "\n".join(f"- {a}" for a in accuracy)
+                     + f"\n\nHow it was lined up with LINZ: heights {al.summary()}; "
+                       f"the model sits {np.hypot(al.dx, al.dy):.1f} m sideways from LINZ "
+                       "(files not moved).\nThe +/- figure is the 95% range of how well open "
+                       "ground matched the LINZ LiDAR after the fit. It doesn't include changes "
+                       "since LINZ flew, or areas left blank (trees, buildings, water, map edge).\n")
+        log(f"    accuracy: {accuracy[0]}")
     ortho_out = os.path.join(out_root, f"{name} - orthophoto.tif") if ortho else None
     if det is not None:
         summary["preview"] = write_change_colour(det, out_root, name, out_crs, ortho_out, log)
@@ -1800,9 +1827,11 @@ def write_change_colour(det, out_root, name, out_crs, ortho_tif, log, span=CHANG
     msp.add_text("blank = not measurable (trees, buildings, water, map edge)",
                  dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.4}).set_placement(
         (x0, y0 - (len(steps) + 1) * size))
-    msp.add_text(f"noise about +/-{det['sigma']:.2f} m: smaller differences aren't real change",
-                 dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.4}).set_placement(
-        (x0, y0 - (len(steps) + 1.8) * size))
+    notes = det.get("accuracy") or [f"noise about +/-{det['sigma']:.2f} m: smaller differences "
+                                    "aren't real change"]
+    for j, line in enumerate(notes):
+        msp.add_text(line, dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.4}).set_placement(
+            (x0, y0 - (len(steps) + 1.8 + 0.8 * j) * size))
     doc.saveas(os.path.join(out_root, f"{name} - change since LINZ legend{tag}.dxf"))
 
     # preview: the colours over the orthophoto
@@ -2269,6 +2298,9 @@ def _describe_result(result, check, out_dir):
     elif result.get("preview") and not check:
         msg += ("\nThe change map since the LINZ LiDAR is ready (red = lower now, blue = higher) "
                 "- click \"Open change preview\" to see it.")
+    if result.get("accuracy"):
+        msg += (f"\nAccuracy: heights about +/-{result['accuracy']:.1f} m (95%) compared with "
+                "LINZ LiDAR - see the accuracy.txt file.")
     if result.get("tilt", 0) > 1.0:
         msg += (f"\nNote: the model was tilted by about {result['tilt']:.1f} m across the site "
                 "(corrected). Ground control points would make it more reliable.")
