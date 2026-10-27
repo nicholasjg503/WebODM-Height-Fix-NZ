@@ -1438,6 +1438,9 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
     # what can't be measured: no data, the ragged map edge, water, trees and buildings
     valid = np.isfinite(c)
     edge = valid & ~ndi.binary_erosion(valid, iterations=max(1, int(round(3 / cell))))
+    # the outer 10 m of the map: drone models bend most at their edges, so change found
+    # mostly there is flagged for checking rather than trusted
+    map_edge = valid & ~ndi.binary_erosion(valid, iterations=max(1, int(round(10 / cell))))
     ldsm = _linz_grid(al, "dsm", T, (h, w), crs)
     ldem = _linz_grid(al, "dem", T, (h, w), crs)
     bare = np.nan_to_num(_bare_ground(ortho, T, (h, w), crs)) > 0.5 if ortho else np.zeros((h, w), bool)
@@ -1512,6 +1515,7 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         sl = ndi.mean(slope, lab, idx)
         de, dn = ndi.mean(dzde, lab, idx), ndi.mean(dzdn, lab, idx)
         bf = ndi.mean(bare.astype(np.float64), lab, idx)
+        ef = ndi.mean(map_edge.astype(np.float64), lab, idx)
         for i in range(n):
             area = count[i] * px
             if area < MIN_AREA or abs(vol[i]) < MIN_VOLUME:
@@ -1520,28 +1524,61 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
             x, y = T * (cc + 0.5, r + 0.5)
             found.append({"label": (kind_, i + 1), "lab": lab, "kind": kind_, "area": area,
                           "volume": float(vol[i]), "extreme": float(ext[i]), "slope": float(sl[i]),
-                          "bare": float(bf[i]), "down": -np.array([de[i], dn[i]]),
-                          "xy": np.array([x, y])})
+                          "bare": float(bf[i]), "edge": float(ef[i]),
+                          "down": -np.array([de[i], dn[i]]), "xy": np.array([x, y])})
 
-    # slips: a cut on a slope with fill directly downhill of it
-    cuts = [f for f in found if f["kind"] == "cut"]
-    fills = [f for f in found if f["kind"] == "fill"]
     for f in found:
         f["type"], f["part"], f["group"] = ("CUT" if f["kind"] == "cut" else "FILL"), "", None
+        if f["edge"] > 0.3:
+            f["type"] = "CHECK"  # mostly in the outer 10 m of the map, where models bend most
+
+    # slips: a cut on a slope with raised ground (debris) starting within DEBRIS_GAP metres
+    # downhill of its edge. Several scarp lobes can feed one debris area.
+    cuts = [f for f in found if f["kind"] == "cut" and f["type"] != "CHECK"]
+    fills = [f for f in found if f["kind"] == "fill" and f["type"] != "CHECK"]
+    fill_lab = fills[0]["lab"] if fills else None
+    gap = max(1, int(round(15.0 / cell)))
     group = 0
+
+    def _within(area, px_):
+        """Cells within px_ cells (straight-line) of an area, in a window around it."""
+        lab_, num_ = area["lab"], area["label"][1]
+        sl_ = ndi.find_objects((lab_ == num_).astype(np.int8))[0]
+        win_ = tuple(slice(max(s.start - px_, 0), s.stop + px_) for s in sl_)
+        return ndi.distance_transform_edt(lab_[win_] != num_) <= px_, win_
     for cut in sorted(cuts, key=lambda f: f["volume"]):
         d = cut["down"]
-        if cut["slope"] < 10 or not np.hypot(*d):
+        if cut["slope"] < 10 or not np.hypot(*d) or fill_lab is None:
             continue
         d = d / np.hypot(*d)
-        reach = 10 + 1.5 * np.sqrt(cut["area"])
-        debris = [f for f in fills if f["group"] is None and 0 < np.hypot(*(f["xy"] - cut["xy"])) <= reach
-                  and np.dot(f["xy"] - cut["xy"], d) / np.hypot(*(f["xy"] - cut["xy"])) >= 0.5]
+        near, win = _within(cut, gap)
+        touched = set(np.unique(fill_lab[win][near]).tolist()) - {0}
+        debris = []
+        for f in fills:
+            v = f["xy"] - cut["xy"]
+            dist = np.hypot(*v)
+            if f["label"][1] in touched and dist > 0 and np.dot(v, d) / dist >= 0.3:
+                debris.append(f)
         if debris:
-            group += 1
-            for f in [cut] + debris:
-                f["type"], f["group"] = "SLIP", group
-                f["part"] = "scarp" if f is cut else "debris"
+            joined = next((f["group"] for f in debris if f["group"]), None)
+            if joined is None:
+                group += 1
+                joined = group
+            cut["type"], cut["group"], cut["part"] = "SLIP", joined, "scarp"
+            for f in debris:
+                f["type"], f["group"], f["part"] = "SLIP", joined, "debris"
+    # further scarp lobes: lowered ground on a slope within the gap of a slip's scarp joins it
+    cut_lab = cuts[0]["lab"] if cuts else None
+    changed = True
+    while changed:
+        changed = False
+        for scarp in [f for f in cuts if f["type"] == "SLIP"]:
+            near, win = _within(scarp, gap)
+            touched = set(np.unique(cut_lab[win][near]).tolist()) - {0, scarp["label"][1]}
+            for f in cuts:
+                if f["type"] == "CUT" and f["slope"] >= 10 and f["label"][1] in touched:
+                    f["type"], f["group"], f["part"] = "SLIP", scarp["group"], "scarp"
+                    changed = True
     for cut in sorted(cuts, key=lambda f: f["volume"]):
         if cut["type"] != "CUT":
             continue
@@ -1568,6 +1605,8 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         ring = ndi.binary_dilation(region, iterations=ring_px) & ~region
         near = (unreliable[pad] & ring).sum() / max(1, ring.sum())
         f["note"] = "next to trees, water or the map edge - check" if near > 0.4 else ""
+        if f["edge"] > 0.3:
+            f["note"] = "at the edge of the map, where drone models bend most - check"
         if f["type"] == "FILL" and near > 0.4:
             # raised ground hemmed in by bush is usually canopy WebODM's DTM didn't remove
             f["type"] = "CHECK"
