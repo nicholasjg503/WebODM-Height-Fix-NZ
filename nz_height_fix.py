@@ -38,7 +38,7 @@ import zipfile
 
 import numpy as np
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 APP_NAME = "WebODM Height Fix NZ"
 HELP_URL = "https://github.com/nicholasjg503/WebODM-Height-Fix-NZ#readme"
 
