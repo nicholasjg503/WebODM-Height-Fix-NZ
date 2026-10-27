@@ -67,37 +67,29 @@ The **Details** box shows what was found. On the Grange Road test site, the mode
 | `<name> - orthophoto.png` + `.pgw` + `.prj` | the same orthophoto as a **transparent PNG with a world file**, for CAD programs (BricsCAD, AutoCAD) that show GeoTIFF no-data as black |
 | `<name> - DSM NZVD2016.tif` | the elevation model, in metres above sea level (NZVD2016), at the **cell size** you picked (0.25 m by default). If your WebODM task made a DTM (ground only), you get `DTM` instead. If it made no elevation model at all, one is built from the point cloud. |
 | `<name> - change since LINZ (m).tif` | your survey minus the LINZ LiDAR, with trees, buildings, water and the ragged map edge left blank. **Negative means the ground is lower now**, for example a slip scar or a cut. Positive means it's higher, for example debris or fill. |
-| `<name> - change areas.dxf` | outlines of each **cut, fill and slip**, on separate layers, labelled with number, area, volume and maximum depth or height. Ready for BricsCAD and AutoCAD. |
-| `<name> - change areas.csv` | the same areas as a table: type, area, cut, fill and net volume, maximum depth, slope, position |
-| `<name> - change areas.png` + `.pgw` (and `.tif`, `.geojson`) | a transparent coloured overlay of the areas for CAD, plus versions for GIS |
-| `<name> - change areas preview.png` | a quick look: the areas drawn over the orthophoto. **Open change preview** in the window opens it. |
+| `<name> - change since LINZ (colour).png` + `.pgw` + `.prj` (and `.tif`) | the same change as a **red-to-blue picture for CAD**. Red means lower now, white means no change, blue means higher now, on a fixed **−2 m to +2 m** scale. Areas that can't be measured are transparent. Attach it in BricsCAD over the orthophoto and **trace slips, cuts and fill by hand**. |
+| `<name> - change since LINZ legend.dxf` | the colour scale with labels, placed just right of the map so it lands beside it in CAD |
+| `<name> - change since LINZ preview.png` | a quick look: the colours over the orthophoto. **Open change preview** in the window opens it. |
 
 All of them are in the coordinate system you picked. The orthophoto keeps all of the image, and the area outside the map is transparent. Elevation files use the no-data value `-9999`.
 
-### Finding cut, fill and slips
+### The change map
 
-With **Find cut, fill and slips since the LINZ LiDAR** ticked, which it is by default, the tool looks for every patch of ground that has moved since LINZ flew:
+The change map is your survey's ground minus LINZ's ground, cleaned up so it's useful for spotting slips and earthworks:
 
-1. **What it can't measure is left out:**
-   - trees and buildings, from LINZ's LiDAR and from your own surface model
+1. **What can't be measured is left blank:**
+   - trees and buildings, from LINZ's LiDAR and your own surface model
+   - cars, tanks and sheds
    - water
-   - the ragged edge of the map
+   - the outer edge of the map (about 8% of its width, 15–40 m), where drone models warp most
 
-   Where your orthophoto shows **bare ground** (soil, rock, gravel), it uses your surface model as the ground. WebODM's ground filter tends to smooth steep bare faces, like slip scarps and batters, out of the DTM.
-2. **Broad warping is removed.** Drone models without ground control bend gently by a few tenths of a metre. That's measured on the stable ground around each area and taken off.
-3. **Areas are found and outlined.** Any patch that's moved more than about 3× the site's noise level counts, typically 0.8–1.3 m. Its outline is then grown out over connected ground that's moved at least about 0.3–0.6 m, so it captures the whole area, not just the deepest part. Patches under 20 m² or 5 m³ are ignored.
-4. **Each area is labelled:**
+   Where your orthophoto shows **bare ground** (soil, rock, gravel), the tool uses your surface model as the ground. WebODM's ground filter tends to smooth steep bare faces, like slip scarps and batters, out of the DTM.
+2. **Each spot is compared with the matching spot in LINZ.** The fit allows for the model's sideways shift and twist, so slopes don't show false change.
+3. **Broad warping is removed.** Drone models without ground control bend gently. That's measured on the stable ground around each spot and taken off.
 
-| Label | Meaning |
-|---|---|
-| `SLIP` | ground lowered on a slope (15° or more) that's now bare, or lowered with raised ground directly downhill of it (the scarp and debris are numbered as one slip) |
-| `CUT` / `FILL` | ground lowered or raised: earthworks, tracks, fill |
-| `SLIP?` | lowered on a steep slope (25° or more) but still vegetated: possibly an older slip |
-| `CHECK` | raised ground hemmed in by bush. Usually it's canopy that WebODM's DTM didn't remove. |
+The **Details** box gives the site's noise level, typically ±0.1–0.4 m. Differences smaller than about three times that aren't real change. Models that are badly bent (a large misfit in the Details box) can still show a metre or so of false change, especially either side of steep faces. Ground control points fix that at the source.
 
-The labels are a guide. Look over each one against the orthophoto. Earthworks on a slope can come out as `SLIP`, and the reverse. On the Grange Road test site, the known slip was found and outlined at **162 m², 128 m³ removed, up to 1.4 m deep**, with the grass around it showing no change.
-
-How well it works depends mostly on how much open ground there is. On very bushy sites only a small part of the map can be measured. The Details box says how much.
+There's also an experimental command-line option, `--find-changes`, that outlines and labels areas automatically as DXF and CSV. It works on clean models but isn't reliable enough yet to depend on.
 
 ### For slips: use a DTM, not a DSM
 
