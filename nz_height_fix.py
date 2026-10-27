@@ -1242,6 +1242,19 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
             log(f"    bare ground taken from WebODM's surface model ({100 * use.mean():.0f}% of cells) "
                 "so steep bare faces aren't smoothed away")
         change = _change_since_linz(dem, transform, dem_crs, al, kind)
+        if change is not None and kind == "DSM" and ortho:
+            # surface model only: where the ground is bare now, the surface IS the ground, so
+            # compare it with LINZ's ground (not its tree tops) to get the real ground change
+            bare = np.nan_to_num(_bare_ground(ortho, transform, dem.shape, dem_crs)) > 0.5
+            ground = _change_since_linz(dem, transform, dem_crs, al, "DTM")
+            if ground is not None:
+                then = (_linz_grid(al, "dsm", transform, dem.shape, dem_crs)
+                        - _linz_grid(al, "dem", transform, dem.shape, dem_crs))
+                with np.errstate(invalid="ignore"):
+                    # grey roofs aren't green either: something tall then that still stands
+                    # well above the ground now is a building, not bare ground
+                    standing = (then > 2.5) & (ground > 2.5)
+                change = np.where(bare & ~standing, ground, change)
         if change is not None and detect:
             if kind == "DSM":
                 log("    note: this is a surface model, so trees and buildings can look like change. "
