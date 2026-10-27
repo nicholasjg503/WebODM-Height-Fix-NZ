@@ -1230,6 +1230,14 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
             d, dT, dcrs = _read_dem(by_name["dsm.tif"], bounds, cell)
             dsm = _to_grid(d, dT, dcrs, transform, dem.shape, dem_crs, "average")
             del d
+            # cars, tanks, utes and sheds aren't ground even when they aren't green: anything
+            # standing up from its surroundings like a bump narrower than ~6 m is replaced by
+            # the ground model. (A grey-scale opening keeps slopes, steps and scarps intact.)
+            import scipy.ndimage as ndi
+            k = max(3, int(round(6.0 / abs(transform.a))) | 1)
+            filled = np.where(np.isfinite(dsm), dsm, np.nanmin(dsm) if np.isfinite(dsm).any() else 0)
+            bump = (filled - ndi.grey_opening(filled, size=(k, k))) > 0.5
+            dsm = np.where(bump, dem, dsm)
     elif clouds:
         kind = "DSM"
         dem, transform, dem_crs, res = _cloud_to_dem(clouds[0], bounds, ortho_crs, task_crs, res=cell)
