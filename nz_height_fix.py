@@ -1344,6 +1344,9 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
     ortho_out = os.path.join(out_root, f"{name} - orthophoto.tif") if ortho else None
     if det is not None:
         summary["preview"] = write_change_colour(det, out_root, name, out_crs, ortho_out, log)
+        # a sensitive version too, for shallow slips and slumps (0.2-0.5 m)
+        write_change_colour(det, out_root, name, out_crs, ortho_out, log, span=0.5,
+                            tag=", 0.5 m", legend_slot=1, make_preview=False)
     if det is not None and det.get("areas"):
         write_change_outputs(det, out_root, name, out_crs, ortho_out, log)
     return summary
@@ -1743,10 +1746,12 @@ def _change_colours(values, span=CHANGE_SPAN):
     return np.moveaxis(np.round(rgb).astype(np.uint8), -1, 0)
 
 
-def write_change_colour(det, out_root, name, out_crs, ortho_tif, log):
+def write_change_colour(det, out_root, name, out_crs, ortho_tif, log, span=CHANGE_SPAN, tag="",
+                        legend_slot=0, make_preview=True):
     """The cleaned change map as a coloured picture for CAD: '<name> - change since LINZ
-    (colour).tif' + transparent .png/.pgw/.prj (blank = not measurable), a DXF legend beside the
-    map, and a preview over the orthophoto. Returns the preview's path."""
+    (colour<tag>).tif' + transparent .png/.pgw/.prj (blank = not measurable) on a +/-span m
+    scale, a DXF legend beside the map (legend_slot shifts it right so several sit side by side),
+    and optionally a preview over the orthophoto. Returns the preview's path."""
     import rasterio
     from pyproj import CRS
     grid, T, crs = det["resid"], det["transform"], det["crs"]
@@ -1754,10 +1759,10 @@ def write_change_colour(det, out_root, name, out_crs, ortho_tif, log):
         grid, T = _warp_array(grid, T, crs, out_crs)
         crs = out_crs
     ok = np.isfinite(grid)
-    rgb = _change_colours(grid)
+    rgb = _change_colours(grid, span)
     rgb[:, ~ok] = 0
     alpha = np.where(ok, 255, 0).astype(np.uint8)
-    base = os.path.join(out_root, f"{name} - change since LINZ (colour)")
+    base = os.path.join(out_root, f"{name} - change since LINZ (colour{tag})")
     h, w = grid.shape
     with rasterio.open(base + ".tif", "w", driver="GTiff", width=w, height=h, count=4,
                        dtype="uint8", crs=crs, transform=T, photometric="RGB",
@@ -1777,18 +1782,18 @@ def write_change_colour(det, out_root, name, out_crs, ortho_tif, log):
     doc.header["$INSUNITS"] = 6
     msp = doc.modelspace()
     doc.layers.add("CHANGE_LEGEND", color=7)
-    x0, y0 = east + 2 * size, north - 2 * size
-    msp.add_text("Change since LINZ LiDAR (m)",
+    x0, y0 = east + 2 * size + legend_slot * 14 * size, north - 2 * size
+    msp.add_text(f"Change since LINZ LiDAR (m), +/-{span:g} m scale",
                  dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.6}).set_placement((x0, y0 + size))
-    steps = np.arange(CHANGE_SPAN, -CHANGE_SPAN - 0.01, -0.5)
+    steps = np.linspace(span, -span, 9)
     for k, v in enumerate(steps):
         yb = y0 - (k + 1) * size
         hatch = msp.add_hatch(dxfattribs={"layer": "CHANGE_LEGEND"})
-        r, g, b = (int(c) for c in _change_colours(np.array([v]))[:, 0])
+        r, g, b = (int(c) for c in _change_colours(np.array([v]), span)[:, 0])
         hatch.dxf.true_color = dxf_colors.rgb2int((r, g, b))
         hatch.paths.add_polyline_path([(x0, yb), (x0 + 2 * size, yb), (x0 + 2 * size, yb + size),
                                        (x0, yb + size)], is_closed=True)
-        label = f"{v:+.1f}" + (" or more (higher now)" if k == 0 else
+        label = (f"{v:+.2f}" if span < 1 else f"{v:+.1f}") + (" or more (higher now)" if k == 0 else
                                " or more (lower now)" if k == len(steps) - 1 else "")
         msp.add_text(label, dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.5}).set_placement(
             (x0 + 2.4 * size, yb + 0.25 * size))
@@ -1798,11 +1803,11 @@ def write_change_colour(det, out_root, name, out_crs, ortho_tif, log):
     msp.add_text(f"noise about +/-{det['sigma']:.2f} m: smaller differences aren't real change",
                  dxfattribs={"layer": "CHANGE_LEGEND", "height": size * 0.4}).set_placement(
         (x0, y0 - (len(steps) + 1.8) * size))
-    doc.saveas(base.replace(" (colour)", " legend") + ".dxf")
+    doc.saveas(os.path.join(out_root, f"{name} - change since LINZ legend{tag}.dxf"))
 
     # preview: the colours over the orthophoto
     preview = None
-    if ortho_tif and os.path.exists(ortho_tif):
+    if make_preview and ortho_tif and os.path.exists(ortho_tif):
         from affine import Affine
         from rasterio.enums import Resampling
         with rasterio.open(ortho_tif) as o:
@@ -1814,16 +1819,16 @@ def write_change_colour(det, out_root, name, out_crs, ortho_tif, log):
             pcrs = o.crs
         vals = _to_grid(grid, T, crs, Tp, shp, pcrs, "nearest")
         m = np.isfinite(vals)
-        col = _change_colours(vals).astype(np.float64)
+        col = _change_colours(vals, span).astype(np.float64)
         img[:, m] = img[:, m] * 0.3 + col[:, m] * 0.7
         img[:, ~inside] = 255
-        preview = base.replace(" (colour)", " preview") + ".png"
+        preview = os.path.join(out_root, f"{name} - change since LINZ preview{tag}.png")
         with rasterio.Env(GDAL_PAM_ENABLED="NO"):
             with rasterio.open(preview, "w", driver="PNG", width=shp[1], height=shp[0], count=3,
                                dtype="uint8") as dst:
                 dst.write(np.clip(img, 0, 255).astype(np.uint8))
     log(f"    wrote {os.path.basename(base)}.tif + transparent .png/.pgw for CAD (red = lower, "
-        f"blue = higher, +/-{CHANGE_SPAN:g} m scale), a DXF legend and a preview")
+        f"blue = higher, +/-{span:g} m scale), a DXF legend" + (" and a preview" if preview else ""))
     return preview
 
 

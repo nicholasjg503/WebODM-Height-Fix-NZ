@@ -68,7 +68,8 @@ The **Details** box shows what was found. On the Grange Road test site, the mode
 | `<name> - DSM NZVD2016.tif` | the elevation model, in metres above sea level (NZVD2016), at the **cell size** you picked (0.25 m by default). If your WebODM task made a DTM (ground only), you get `DTM` instead. If it made no elevation model at all, one is built from the point cloud. |
 | `<name> - change since LINZ (m).tif` | your survey minus the LINZ LiDAR, with trees, buildings, water and the ragged map edge left blank. **Negative means the ground is lower now**, for example a slip scar or a cut. Positive means it's higher, for example debris or fill. |
 | `<name> - change since LINZ (colour).png` + `.pgw` + `.prj` (and `.tif`) | the same change as a **red-to-blue picture for CAD**. Red means lower now, white means no change, blue means higher now, on a fixed **−2 m to +2 m** scale. Areas that can't be measured are transparent. Attach it in BricsCAD over the orthophoto and **trace slips, cuts and fill by hand**. |
-| `<name> - change since LINZ legend.dxf` | the colour scale with labels, placed just right of the map so it lands beside it in CAD |
+| `<name> - change since LINZ (colour, 0.5 m).png` + `.pgw` + `.prj` (and `.tif`) | the same map on a **sensitive −0.5 m to +0.5 m scale**, for spotting shallow slips and slumps. Patches under about three times the noise level in the Details box may not be real. Check them on the ground. |
+| `<name> - change since LINZ legend.dxf` (and `legend, 0.5 m.dxf`) | the colour scales with labels, placed just right of the map so they land beside it in CAD |
 | `<name> - change since LINZ preview.png` | a quick look: the colours over the orthophoto. **Open change preview** in the window opens it. |
 
 All of them are in the coordinate system you picked. The orthophoto keeps all of the image, and the area outside the map is transparent. Elevation files use the no-data value `-9999`.
