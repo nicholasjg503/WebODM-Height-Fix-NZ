@@ -423,14 +423,21 @@ def _surface_samples(path, fallback_crs, cell=1.0, target=60000):
 class Alignment:
     """Height correction plane that puts a WebODM model onto LINZ.
 
-    Horizontal positions are left as WebODM made them. (dx, dy) is how far the model sits from
-    LINZ sideways: it's only used to compare like with like - LINZ is sampled at the matching
-    spot - because on a slope a 2 m sideways offset alone looks like ~1 m of height change.
+    Horizontal positions are left as WebODM made them. (dx, dy) and the twist `kappa` (radians,
+    about (x0, y0)) say where each spot of the model is in LINZ: they're only used to compare
+    like with like - LINZ is sampled at the matching spot - because on a slope a 2 m sideways
+    offset alone looks like ~1 m of height change.
     """
 
-    def __init__(self, x0, y0, coef, spread, size, linz, dx=0.0, dy=0.0):
-        self.x0, self.y0, self.dx, self.dy = x0, y0, dx, dy
+    def __init__(self, x0, y0, coef, spread, size, linz, dx=0.0, dy=0.0, kappa=0.0):
+        self.x0, self.y0, self.dx, self.dy, self.kappa = x0, y0, dx, dy, kappa
         self.coef, self.spread, self.size, self.linz = coef, spread, size, linz
+
+    def matching(self):
+        """Affine taking a model position to the matching LINZ position (model coordinates)."""
+        from affine import Affine
+        k = self.kappa
+        return Affine(1, -k, self.dx + k * self.y0, k, 1, self.dy - k * self.x0)
 
     def dz(self, x, y):
         a, b, c = self.coef
@@ -457,12 +464,15 @@ def linz_align(path, kind, log, fallback_crs=None):
     to_nztm = Transformer.from_crs(crs, "EPSG:2193", always_xy=True)
     X, Y = (np.asarray(v) for v in to_nztm.transform(x, y))
     cx, cy = float(x.mean()), float(y.mean())
-    tx, ty = to_nztm.transform([cx, cx + 1, cx], [cy, cy, cy + 1])
-    J = np.array([[tx[1] - tx[0], tx[2] - tx[0]], [ty[1] - ty[0], ty[2] - ty[0]]])
+    jx, jy = to_nztm.transform([cx, cx + 1, cx], [cy, cy, cy + 1])
+    J = np.array([[jx[1] - jx[0], jx[2] - jx[0]], [jy[1] - jy[0], jy[2] - jy[0]]])
 
     def at(grid, dx=0.0, dy=0.0):
-        """A LINZ grid at the sample points, offset (dx, dy) m in the model's coordinates."""
-        sx, sy = J @ (dx, dy)
+        """A LINZ grid at the sample points, offset (dx, dy) m (scalars or per-point arrays)
+        in the model's coordinates."""
+        dx, dy = np.broadcast_arrays(np.asarray(dx, float), np.asarray(dy, float))
+        sx = J[0, 0] * dx + J[0, 1] * dy
+        sy = J[1, 0] * dx + J[1, 1] * dy
         return _bilinear(grid, X + sx, Y + sy)
 
     log(f"    comparing {os.path.basename(path)} with LINZ 1 m LiDAR ...")
@@ -483,41 +493,62 @@ def linz_align(path, kind, log, fallback_crs=None):
     if open_.sum() < 50:
         return None
 
-    # how far the model sits sideways from LINZ, measured on open ground only (trees and
-    # buildings change shape between surveys). Not applied to any output - only used so the
-    # comparisons below are made at matching spots.
+    # Starting point: coarse search for the sideways offset on open ground (trees and buildings
+    # change shape between surveys).
     def score(dx, dy):
         r_ = (z - at(ref, dx, dy))[open_]
         r_ = r_[np.isfinite(r_)]
         return np.median(np.abs(r_ - np.median(r_))) if len(r_) >= 200 else np.inf
-    s0 = score(0.0, 0.0)
-    best = min((score(dx, dy), dx, dy) for dx in np.arange(-4, 4.01, 0.5)
-               for dy in np.arange(-4, 4.01, 0.5))
-    best = min((score(dx, dy), dx, dy) for dx in np.arange(best[1] - 0.4, best[1] + 0.41, 0.2)
-               for dy in np.arange(best[2] - 0.4, best[2] + 0.41, 0.2))
-    dx, dy = (round(float(best[1]), 1), round(float(best[2]), 1)) if best[0] < 0.85 * s0 else (0.0, 0.0)
-    if dx or dy:
-        log(f"    sideways: the model sits {np.hypot(dx, dy):.1f} m from LINZ ({-dx:+.1f} m east, "
-            f"{-dy:+.1f} m north of it). Your files aren't moved - LINZ is just compared at the "
-            "matching spot, so slopes don't show false change.")
+    best = min((score(dx, dy), dx, dy) for dx in np.arange(-8, 8.01, 1.0)
+               for dy in np.arange(-8, 8.01, 1.0))
 
-    # height: robust plane on stable open ground (LINZ DSM ~ DEM = no trees/buildings);
-    # cells that changed since the LiDAR (slips, earthworks) are rejected as outliers
-    r = z - at(ref, dx, dy)
-    open_ &= np.isfinite(r)
-    A = np.c_[x - cx, y - cy, np.ones_like(x)]
-    inl = open_.copy()
-    for _ in range(20):
-        coef = np.linalg.lstsq(A[inl], r[inl], rcond=None)[0]
-        res = r - A @ coef
-        sig = 1.4826 * np.median(np.abs(res[inl]))
-        new = open_ & (np.abs(res) < max(3 * sig, 0.3))
-        if (new == inl).all():
+    # LZD ("least Z-difference", Rosenholm & Torlegard 1988) with robust reweighting: solve
+    # together for the height shift, tilt (omega, phi), twist about the vertical (kappa) and
+    # sideways shift that best fit the model onto LINZ, using the terrain's own slopes. Ground
+    # that has changed since the LiDAR (slips, earthworks) gets down-weighted away, so it can't
+    # drag the fit. Nothing is moved sideways in the outputs - the horizontal part is only used
+    # to compare each spot with the matching spot in LINZ.
+    xs, ys = x - cx, y - cy
+    zs = z - np.median(z[open_])
+    tz, tx, ty, om, ph, ka = 0.0, float(best[1]), float(best[2]), 0.0, 0.0, 0.0
+    tz = float(np.nanmedian((at(ref, tx, ty) - z)[open_]))
+    w = open_.astype(np.float64)
+    for _ in range(25):
+        hx = tx - ka * ys + ph * zs  # where each sample lands in LINZ (model coordinates)
+        hy = ty + ka * xs - om * zs
+        zr = at(ref, hx, hy)
+        gx = (at(ref, hx + 1, hy) - at(ref, hx - 1, hy)) / 2  # LINZ slopes there
+        gy = (at(ref, hx, hy + 1) - at(ref, hx, hy - 1)) / 2
+        v = z + tz - ph * xs + om * ys - zr  # model (moved) minus LINZ
+        ok = open_ & np.isfinite(v) & np.isfinite(gx) & np.isfinite(gy)
+        sig = max(0.05, 1.4826 * float(np.median(np.abs(v[ok] - np.median(v[ok])))))
+        u = (v - np.median(v[ok])) / (4.685 * sig)
+        w = np.where(ok & (np.abs(u) < 1), (1 - u ** 2) ** 2, 0.0)  # Tukey biweight
+        A = np.c_[np.ones_like(v), -gx, -gy, ys + gy * zs, -xs - gx * zs, gx * ys - gy * xs]
+        sw = np.sqrt(w)[ok]
+        step = np.linalg.lstsq(A[ok] * sw[:, None], -v[ok] * sw, rcond=None)[0]
+        tz, tx, ty, om, ph, ka = (p + s for p, s in zip((tz, tx, ty, om, ph, ka), step))
+        if abs(step[0]) < 0.002 and np.hypot(step[1], step[2]) < 0.01 and abs(step[5]) < 1e-6:
             break
-        inl = new
+    if not all(np.isfinite((tz, tx, ty, om, ph, ka))) or np.hypot(tx, ty) > 25:
+        raise FixError("Couldn't line the model up with LINZ (the fit didn't settle).")
+    inl = w > 0
+    res = v - np.median(v[inl])
     spread = float(np.median(np.abs(res[inl])))
     size = float(max(np.ptp(x), np.ptp(y)))
-    al = Alignment(cx, cy, coef, spread, size, {"dsm": dsm, "dem": dem, "flat": flat}, dx, dy)
+    # height correction = what the fit adds to z: tz - phi*x + omega*y  (Alignment.dz form)
+    coef = np.array([ph, -om, -tz])
+    dx, dy = round(float(tx), 2), round(float(ty), 2)
+    al = Alignment(cx, cy, coef, spread, size, {"dsm": dsm, "dem": dem, "flat": flat}, dx, dy,
+                   float(ka))
+    shift = np.hypot(dx, dy)
+    if shift >= 0.3 or abs(ka) * size / 2 >= 0.3:
+        log(f"    sideways: the model sits {shift:.1f} m from LINZ ({-dx:+.1f} m east, "
+            f"{-dy:+.1f} m north of it)"
+            + (f", twisted {np.degrees(ka):+.2f} deg ({abs(ka) * size / 2:.1f} m at the edges)"
+               if abs(ka) * size / 2 >= 0.3 else "")
+            + ". Your files aren't moved - LINZ is just compared at the matching spot, so slopes "
+              "don't show false change.")
     stable = inl.sum() / open_.sum()
     log(f"    vertical: {al.offset:+.2f} m, tilt {al.tilt:.2f} m across {size:.0f} m, "
         f"fitted on {inl.sum():,} open-ground cells ({100 * stable:.0f}% matched LINZ, "
@@ -1303,11 +1334,9 @@ def export_maps(files, out_root, name, mode, offset, geoid, task_crs, check, log
 
 def _linz_grid(al, key, transform, shape, crs, method="bilinear"):
     """One of the LINZ layers held by an Alignment ('dsm', 'dem', 'flat'), on a survey grid."""
-    from affine import Affine
     a, T = al.linz[key]
-    # sample LINZ at the spot matching each survey cell (see Alignment.dx/dy)
-    return _to_grid(a, T, "EPSG:2193", Affine.translation(al.dx, al.dy) * transform, shape, crs,
-                    method)
+    # sample LINZ at the spot matching each survey cell (see Alignment)
+    return _to_grid(a, T, "EPSG:2193", al.matching() * transform, shape, crs, method)
 
 
 def _change_since_linz(dem, transform, crs, al, kind):
@@ -1491,6 +1520,12 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
     g_row, g_col = np.gradient(ldem, cell)
     dzde, dzdn = np.nan_to_num(g_col), np.nan_to_num(-g_row)
     slope = np.degrees(np.arctan(np.hypot(dzde, dzdn)))
+    # slope of the ground as it is NOW (survey): earthworks leave flat platforms, pads and
+    # driveways; slip scars and debris are steep and lumpy. Smoothed over ~2 m.
+    now = ndi.uniform_filter(np.nan_to_num(ldem + c, nan=0.0), size=max(3, int(round(2 / cell))))
+    gr2, gc2 = np.gradient(now, cell)
+    slope_now = np.degrees(np.arctan(np.hypot(gr2, gc2)))
+    FLAT = 10.0  # degrees
 
     eight = np.ones((3, 3), dtype=bool)
     found = []
@@ -1513,6 +1548,7 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         ext = (ndi.minimum if sign < 0 else ndi.maximum)(np.nan_to_num(resid), lab, idx)
         com = ndi.center_of_mass(mask, lab, idx)
         sl = ndi.mean(slope, lab, idx)
+        sn = ndi.median(np.where(np.isfinite(c), slope_now, np.nan), lab, idx)
         de, dn = ndi.mean(dzde, lab, idx), ndi.mean(dzdn, lab, idx)
         bf = ndi.mean(bare.astype(np.float64), lab, idx)
         ef = ndi.mean(map_edge.astype(np.float64), lab, idx)
@@ -1524,7 +1560,7 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
             x, y = T * (cc + 0.5, r + 0.5)
             found.append({"label": (kind_, i + 1), "lab": lab, "kind": kind_, "area": area,
                           "volume": float(vol[i]), "extreme": float(ext[i]), "slope": float(sl[i]),
-                          "bare": float(bf[i]), "edge": float(ef[i]),
+                          "bare": float(bf[i]), "edge": float(ef[i]), "flat": float(sn[i]) < FLAT,
                           "down": -np.array([de[i], dn[i]]), "xy": np.array([x, y])})
 
     for f in found:
@@ -1548,7 +1584,7 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         return ndi.distance_transform_edt(lab_[win_] != num_) <= px_, win_
     for cut in sorted(cuts, key=lambda f: f["volume"]):
         d = cut["down"]
-        if cut["slope"] < 10 or not np.hypot(*d) or fill_lab is None:
+        if cut["slope"] < 10 or cut["flat"] or not np.hypot(*d) or fill_lab is None:
             continue
         d = d / np.hypot(*d)
         near, win = _within(cut, gap)
@@ -1557,7 +1593,8 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         for f in fills:
             v = f["xy"] - cut["xy"]
             dist = np.hypot(*v)
-            if f["label"][1] in touched and dist > 0 and np.dot(v, d) / dist >= 0.3:
+            if (f["label"][1] in touched and not f["flat"] and dist > 0
+                    and np.dot(v, d) / dist >= 0.3):
                 debris.append(f)
         if debris:
             joined = next((f["group"] for f in debris if f["group"]), None)
@@ -1576,12 +1613,15 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
             near, win = _within(scarp, gap)
             touched = set(np.unique(cut_lab[win][near]).tolist()) - {0, scarp["label"][1]}
             for f in cuts:
-                if f["type"] == "CUT" and f["slope"] >= 10 and f["label"][1] in touched:
+                if (f["type"] == "CUT" and f["slope"] >= 10 and not f["flat"]
+                        and f["label"][1] in touched):
                     f["type"], f["group"], f["part"] = "SLIP", scarp["group"], "scarp"
                     changed = True
     for cut in sorted(cuts, key=lambda f: f["volume"]):
         if cut["type"] != "CUT":
             continue
+        if cut["flat"]:
+            continue  # cut down to a flat surface: a platform or track - earthworks
         if cut["slope"] >= 15 and cut["bare"] >= 0.3:
             # fresh bare ground lowered on a slope: a slip scar (any debris has gone or is
             # under vegetation)
@@ -1607,8 +1647,9 @@ def detect_change_areas(change, transform, crs, al, log, surface_change=None, or
         f["note"] = "next to trees, water or the map edge - check" if near > 0.4 else ""
         if f["edge"] > 0.3:
             f["note"] = "at the edge of the map, where drone models bend most - check"
-        if f["type"] == "FILL" and near > 0.4:
-            # raised ground hemmed in by bush is usually canopy WebODM's DTM didn't remove
+        if f["type"] == "FILL" and near > 0.4 and not f["flat"]:
+            # lumpy raised ground hemmed in by bush is usually canopy WebODM's DTM didn't
+            # remove (a flat raised surface - pad, driveway, platform - is real fill)
             f["type"] = "CHECK"
         code = ({"CUT": 1, "FILL": 2, "SLIP?": 5, "CHECK": 6}.get(f["type"])
                 or (3 if f["part"] == "scarp" else 4))
